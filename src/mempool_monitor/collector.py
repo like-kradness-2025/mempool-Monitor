@@ -17,6 +17,10 @@ class CollectionError(RuntimeError):
     pass
 
 
+# How many recent snapshots to feed the sanity median filter.
+RECENT_FOR_SANITY = 7
+
+
 @dataclass(frozen=True)
 class RawCollection:
     collected_at: int
@@ -186,11 +190,32 @@ def collect_once_all(config: Config, storage: Any) -> bool:
 
     # Main collection (mempool/fees/blocks/btc_price) — also fetches mining hash rate
     try:
+        from .processor import process_collection  # noqa: PLC0415
+        from .sanity import is_plausible  # noqa: PLC0415
+
         with MempoolClient(config) as client:
             raw = client.collect()
-        from .processor import process_collection  # noqa: PLC0415
-
-        snapshot, projected = process_collection(raw, config)
+            snapshot, projected = process_collection(raw, config)
+            # mempool.space's CDN occasionally alternates between a current
+            # and a stale/partial response. If the new snapshot deviates too
+            # far from the recent median, re-fetch once before accepting it.
+            previous = storage.latest_snapshot(before=snapshot.collected_at)
+            recent = storage.snapshots_since(
+                snapshot.collected_at - 3600
+            )[-RECENT_FOR_SANITY:]
+            if not is_plausible(snapshot, previous, recent):
+                logging.warning(
+                    "implausible snapshot (count %d, vsize %.1fMB); re-fetching once",
+                    snapshot.mempool_count,
+                    snapshot.mempool_vsize / 1_000_000,
+                )
+                raw = client.collect()
+                snapshot, projected = process_collection(raw, config)
+                if not is_plausible(snapshot, previous, recent):
+                    logging.warning(
+                        "second fetch still implausible (count=%d); storing anyway",
+                        snapshot.mempool_count,
+                    )
         storage.insert_snapshot(snapshot, projected)
         ok = True
         logging.info(

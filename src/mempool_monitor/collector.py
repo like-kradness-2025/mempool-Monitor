@@ -234,6 +234,23 @@ def collect_once_all(config: Config, storage: Any) -> bool:
                 current_hashrate=raw.current_hashrate,
             )
             storage.insert_mining(mine_snap)
+
+        # Fallback: if mining fields are missing (API hiccup), fill snapshot
+        # from the last stored values so the difficulty panel never goes blank.
+        if snapshot.current_difficulty is None or snapshot.current_hashrate is None:
+            last_mine = storage.latest_mining()
+            if last_mine is not None:
+                from dataclasses import replace as _replace  # noqa: PLC0415
+
+                snapshot = _replace(
+                    snapshot,
+                    current_difficulty=snapshot.current_difficulty
+                    if snapshot.current_difficulty is not None
+                    else last_mine.current_difficulty,
+                    current_hashrate=snapshot.current_hashrate
+                    if snapshot.current_hashrate is not None
+                    else last_mine.current_hashrate,
+                )
     except (CollectionError, Exception) as exc:
         logging.error("main collection failed: %s", exc)
         # Fallback: fetch mining data separately
@@ -247,12 +264,16 @@ def collect_once_all(config: Config, storage: Any) -> bool:
             storage.insert_mining(mine_snap)
             ok = True
 
-    # Difficulty (always separate call)
-    diff_data = fetch_difficulty()
-    if diff_data is not None:
-        diff_snap = _difficulty_to_snapshot(diff_data)
-        storage.insert_difficulty(diff_snap)
-        ok = True
+    # Difficulty (separate API call, but only ~hourly to keep 1-min collection light)
+    last_diff = storage.latest_difficulty()
+    if last_diff is None or collected_at - last_diff.collected_at > 3600:
+        diff_data = fetch_difficulty()
+        if diff_data is not None:
+            diff_snap = _difficulty_to_snapshot(diff_data)
+            storage.insert_difficulty(diff_snap)
+            ok = True
+        else:
+            logging.warning("difficulty fetch failed; keeping last value")
 
     # Enforce size limit
     storage.enforce_size_limit()

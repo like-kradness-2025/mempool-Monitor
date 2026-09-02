@@ -14,11 +14,10 @@ from pathlib import Path
 import httpx
 
 from .alerts import evaluate_alerts
-from .collector import CollectionError, MempoolClient, collect_loop_all
+from .collector import collect_loop_all
 from .config import Config, load_config
 from .discord import DiscordWebhook, mask_secrets
 from .models import Alert, Snapshot
-from .processor import DataValidationError, process_collection
 from .storage import Storage
 
 
@@ -117,16 +116,19 @@ def send_alerts(
 
 
 def collect_once(config: Config, storage: Storage, notify: bool) -> int:
-    previous = storage.latest_snapshot()
-    try:
-        with MempoolClient(config) as client:
-            raw = client.collect()
-        snapshot, projected = process_collection(raw, config)
-        storage.insert_snapshot(snapshot, projected)
-    except (CollectionError, DataValidationError) as exc:
+    """Collect one full snapshot (mempool + mining + difficulty) and store it.
+
+    Uses collector.collect_once_all which includes the stale-CDN sanity
+    filter and saves mining/difficulty alongside the snapshot.
+    """
+    from .collector import collect_once_all  # noqa: PLC0415
+
+    ok = collect_once_all(config, storage)
+    if not ok:
         failures = int(storage.get_state("api_consecutive_failures", "0")) + 1
         storage.set_state("api_consecutive_failures", str(failures))
-        logging.error("collection failed (%d consecutive): %s", failures, exc)
+        previous = storage.latest_snapshot()
+        logging.error("collection failed (%d consecutive)", failures)
         if notify and failures == 3 and previous:
             send_alerts(
                 config,
@@ -145,8 +147,12 @@ def collect_once(config: Config, storage: Storage, notify: bool) -> int:
 
     prior_failures = int(storage.get_state("api_consecutive_failures", "0"))
     storage.set_state("api_consecutive_failures", "0")
+    snapshot = storage.latest_snapshot()
+    if snapshot is None:
+        return 1
     fifteen_minutes_ago = storage.snapshot_at_or_before(snapshot.collected_at - 900)
-    alerts = evaluate_alerts(snapshot, previous, fifteen_minutes_ago)
+    alerts = evaluate_alerts(snapshot, storage.latest_snapshot(
+        before=snapshot.collected_at), fifteen_minutes_ago)
     if prior_failures >= 3:
         alerts.append(
             Alert(

@@ -1,14 +1,24 @@
 # mempool-monitor
 
-Bitcoin mempool monitoring & analysis — a **zero-dependency** Python CLI
-(stdlib only) backed by the [mempool.space API](https://mempool.space/docs/api).
+Bitcoin mempool monitoring & analysis — backed by the
+[mempool.space API](https://mempool.space/docs/api).
+
+> このリポジトリは、以前作った **6パネル「Mempool Monitor — Live Dashboard」** を
+> セッション履歴から完全復元したものです。
 
 ## Features
 
-- `snapshot` — fetch current mempool stats (tx count, vsize, fees) and persist to SQLite
-- `monitor` — poll continuously at a fixed interval, storing each snapshot
-- `latest` / `history` — read back stored snapshots (text or JSON)
-- SQLite storage with no external dependencies (`sqlite3`, `urllib` only)
+- **6-panel dark-theme dashboard chart**
+  1. ◆ BTC Price (CoinGecko)
+  2. ■ Mempool size (vMB + tx count)
+  3. ● Recommended fees (5 levels)
+  4. ▲ Fee-band backlog (stackplot: 1-2 / 2-5 / 5-10 / 10-20 / 20-50 / >=50)
+  5. ★ Difficulty & Hashrate
+  6. ▶ Block timing (age / avg interval, 10/30/60min guides)
+- Snapshot collection → SQLite (mempool, fees, backlog, blocks, mining, difficulty)
+- Alert evaluation (congestion, block delay, fee surge)
+- Discord webhook delivery (report / alerts)
+- `collect` (single/loop) / `run` / `chart` / `status` / `prune` CLI
 
 ## Install
 
@@ -17,53 +27,73 @@ cd ~/Tool/mempool-Monitor
 pip install -e .
 ```
 
+Dependencies: `httpx`, `matplotlib`, `numpy` (+ Pillow for verification).
+
 ## Usage
 
 ```bash
-# One-off snapshot
-mempool-monitor snapshot
+# One-off collection (stores a snapshot)
+mempool-monitor collect
 
-# Continuous monitoring every 60s (Ctrl+C to stop)
-mempool-monitor monitor --interval 60
+# Continuous collection at 60s
+mempool-monitor collect --loop --interval 60
 
-# Read back
-mempool-monitor latest
-mempool-monitor history --limit 24 --json
+# Render 6-panel dashboard chart (last 24h by default)
+mempool-monitor chart --output /tmp/mempool.png
+
+# Show status / statistics
+mempool-monitor status
 ```
 
-All commands accept `--db <path>` to override the default
-(`~/.mempool-monitor/mempool.db`).
+Configuration via TOML (`--config path.toml`, or `MEMPOOL_MONITOR_CONFIG` env):
 
-## Example output
+```toml
+[api]
+base_url = "https://mempool.space"
+timeout_seconds = 10
+max_retries = 3
 
+[monitor]
+chart_hours = 24
+report_interval_minutes = 60
+
+[thresholds]
+moderate_fee = 5.0
+high_fee = 20.0
+extreme_fee = 50.0
+moderate_backlog_blocks = 2.0
+high_backlog_blocks = 3.0
+extreme_backlog_blocks = 5.0
+
+[paths]
+database = "~/.mempool-monitor/mempool.sqlite3"
+output_dir = "~/.mempool-monitor/charts"
+log_dir = "~/.mempool-monitor/logs"
+
+[discord]
+username = "BTC Mempool Monitor"
+# webhook_url = "https://discord.com/api/webhooks/..."
 ```
-[2026-09-02T01:00:00+00:00] height=965104 txs=86,502 vsize=43.0 MB fastest=2 sat/vB
-```
+
+`DISCORD_WEBHOOK_URL` env overrides the webhook.
 
 ## Data model
 
-`snapshots` table:
+| table | purpose |
+|---|---|
+| `snapshots` | per-collection mempool snapshot (fees, count, vsize, backlogs, blocks) |
+| `projected_blocks` | next 6 blocks estimated from mempool-blocks API |
+| `difficulty` | difficulty adjustment progress |
+| `mining` | current difficulty + hashrate |
+| `delivery_log` | Discord delivery attempts |
+| `runtime_state` | key/value runtime flags (consecutive failures etc.) |
 
-| column | type | meaning |
-|---|---|---|
-| ts | TEXT (PK) | ISO8601 UTC timestamp |
-| block_height | INTEGER | current chain tip |
-| count | INTEGER | unconfirmed tx count |
-| vsize | INTEGER | total mempool virtual size (vbytes) |
-| total_fee | INTEGER | total fee (sat) |
-| fastest_fee | INTEGER | fastest fee estimate (sat/vB) |
-| half_hour_fee | INTEGER | 30-min estimate (sat/vB) |
-| hour_fee | INTEGER | 1-hour estimate (sat/vB) |
-| economy_fee | INTEGER | economy estimate (sat/vB) |
-| minimum_fee | INTEGER | minimum relay fee (sat/vB) |
+## Roadmap
 
-## Roadmap (small → big)
-
-- [x] Snapshot + history storage
-- [ ] Fee histogram percentiles (p25/p50/p75/p90)
-- [ ] Mempool growth / block-clear tracking
-- [ ] Discord alert integration
-- [ ] Charts (matplotlib, opt-in)
+- [x] 6-panel dashboard (restored)
+- [x] Alert evaluation + Discord delivery
+- [ ] Fee histogram percentiles
+- [ ] Block-clear tracking
 
 ## License
 

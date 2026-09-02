@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Periodic mempool snapshot collection + chart generation.
+"""Collect mempool snapshots and render the 6-panel dashboard chart.
 
-Used by the Hermes cron job: this script collects a fresh snapshot and renders
-the latest chart PNG. The cron prompt then delivers the PNG to Discord via
-MEDIA:<path> in its response.
+Used by the Hermes cron job: collects fresh snapshots, then renders the
+restored 6-panel "Mempool Monitor — Live Dashboard" chart via the CLI.
 
 Usage:
-  python3 collect_and_chart.py [--interval N] [--ticks N] [--out PATH] [--db PATH]
+  python3 collect_and_chart.py [--ticks N] [--interval S] [--out PATH]
 
-Defaults: 1 tick (single snapshot + chart). The cron job itself decides cadence.
+Outputs "chart: <absolute path>" on stdout on success.
 """
 from __future__ import annotations
 
 import argparse
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -20,69 +20,43 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC = REPO_ROOT / "src"
 CHARTS_DIR = REPO_ROOT / "charts"
+PYTHON = sys.executable
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Collect snapshot + render chart")
-    parser.add_argument("--interval", type=int, default=0,
-                        help="seconds between ticks (0 = single tick)")
-    parser.add_argument("--ticks", type=int, default=1,
-                        help="number of snapshots to collect")
+    parser = argparse.ArgumentParser(description="Collect + render 6-panel chart")
+    parser.add_argument("--ticks", type=int, default=1, help="snapshots to collect")
+    parser.add_argument("--interval", type=int, default=60, help="seconds between ticks")
     parser.add_argument("--out", default=str(CHARTS_DIR / "mempool_chart_latest.png"))
-    parser.add_argument("--db", default="~/.mempool-monitor/mempool.db")
     args = parser.parse_args()
 
+    env = {"PYTHONPATH": str(SRC), "MPLBACKEND": "Agg"}
+
+    for i in range(args.ticks):
+        rc = subprocess.run(
+            [PYTHON, "-m", "mempool_monitor.cli", "collect"],
+            cwd=REPO_ROOT, env={**__import__("os").environ, **env},
+        ).returncode
+        if rc != 0:
+            print(f"collect failed (tick {i+1})", file=sys.stderr)
+            return rc
+        if i < args.ticks - 1:
+            time.sleep(args.interval)
+
     out_path = Path(args.out).expanduser()
-    db = str(Path(args.db).expanduser())
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    rc = subprocess.run(
+        [PYTHON, "-m", "mempool_monitor.cli", "chart", "--output", str(out_path)],
+        cwd=REPO_ROOT, env={**__import__("os").environ, **env},
+    ).returncode
+    if rc != 0:
+        print("chart generation failed", file=sys.stderr)
+        return rc
+    if not out_path.is_file() or out_path.stat().st_size == 0:
+        print(f"missing chart: {out_path}", file=sys.stderr)
+        return 1
 
-    sys.path.insert(0, str(SRC))
-    os_env = __import__("os")
-    os_env.environ.setdefault("MPLBACKEND", "Agg")
-
-    from mempool_monitor.api import MempoolClient
-    from mempool_monitor.chart import render_chart
-    from mempool_monitor.cli import _now_iso
-    from mempool_monitor.store import SnapshotStore
-
-    client = MempoolClient(timeout=20)
-    store = SnapshotStore(db)
-
-    ok = 0
-    try:
-        for i in range(args.ticks):
-            for attempt in range(4):
-                try:
-                    stats = client.get_mempool_stats()
-                    fees = client.get_recommended_fees()
-                    height = client.get_block_height()
-                    store.insert_snapshot(
-                        ts=_now_iso(), block_height=height, count=stats.count,
-                        vsize=stats.vsize, total_fee=stats.total_fee,
-                        fastest_fee=fees.fastest_fee,
-                        half_hour_fee=fees.half_hour_fee,
-                        hour_fee=fees.hour_fee, economy_fee=fees.economy_fee,
-                        minimum_fee=fees.minimum_fee,
-                    )
-                    ok += 1
-                    print(f"tick {i+1}: txs={stats.count} fees={fees.fastest_fee}",
-                          flush=True)
-                    break
-                except Exception as exc:  # noqa: BLE001
-                    print(f"tick {i+1}: retry {attempt+1}: {exc}", flush=True)
-                    time.sleep(3)
-            if i < args.ticks - 1:
-                time.sleep(args.interval)
-
-        if ok == 0:
-            print("no snapshots collected", file=sys.stderr)
-            return 1
-
-        n = len(store.recent(limit=500))
-        out = render_chart(store, out_path, limit=500)
-        print(f"chart: {out} (from {n} snapshots)", flush=True)
-    finally:
-        store.close()
-
+    print(f"chart: {out_path}")
     return 0
 
 

@@ -162,12 +162,49 @@ class TestChart(unittest.TestCase):
     def test_render_chart_produces_png(self):
         import matplotlib
         matplotlib.use("Agg")
-        from mempool_monitor.chart import render_chart
+        from mempool_monitor.chart import generate_chart
         from PIL import Image
 
         self._seed(self.store)
+        # Build Snapshot objects from seeded rows
+        from mempool_monitor.models import CongestionLevel, Snapshot
+
+        rows = self.store.recent(limit=20)
+        snaps = [
+            Snapshot(
+                collected_at=int(r["ts"].replace("2026-09-02T", "").split(":")[0]) + 0,
+                fastest_fee=float(r["fastest_fee"]),
+                half_hour_fee=float(r["half_hour_fee"]),
+                hour_fee=float(r["hour_fee"]),
+                economy_fee=float(r["economy_fee"]),
+                minimum_fee=float(r["minimum_fee"]),
+                mempool_count=int(r["count"]),
+                mempool_vsize=int(r["vsize"]),
+                mempool_total_fee=1,
+                backlog_1=1_000_000.0,
+                backlog_2=500_000.0,
+                backlog_5=100_000.0,
+                backlog_10=0.0,
+                backlog_20=0.0,
+                backlog_50=0.0,
+                latest_block_height=int(r["block_height"]),
+                latest_block_timestamp=1,
+                block_age_seconds=10,
+                avg_block_interval_seconds=600.0,
+                latest_block_tx_count=1000,
+                latest_block_size=1_500_000,
+                latest_block_weight=3_900_000,
+                congestion_level=CongestionLevel.LOW,
+                provider="test",
+                api_latency_ms=10.0,
+                btc_price_usd=65000.0,
+                current_difficulty=90_000_000_000_000.0,
+                current_hashrate=600_000_000_000_000_000_000.0,
+            )
+            for r in rows
+        ]
         out = Path(self.tmp.name) / "chart.png"
-        result = render_chart(self.store, out)
+        result = generate_chart(snaps, out)
         self.assertTrue(result.is_file())
         self.assertGreater(result.stat().st_size, 1000)
         img = Image.open(out)
@@ -176,10 +213,10 @@ class TestChart(unittest.TestCase):
     def test_render_chart_empty_raises(self):
         import matplotlib
         matplotlib.use("Agg")
-        from mempool_monitor.chart import render_chart
+        from mempool_monitor.chart import generate_chart
 
         with self.assertRaises(ValueError):
-            render_chart(self.store, Path(self.tmp.name) / "empty.png")
+            generate_chart([], Path(self.tmp.name) / "empty.png")
 
 
 if __name__ == "__main__":

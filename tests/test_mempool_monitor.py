@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 import urllib.error
@@ -136,6 +137,49 @@ class TestSnapshotStore(unittest.TestCase):
 
     def test_latest_empty(self):
         self.assertIsNone(self.store.latest())
+
+
+class TestChart(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = str(Path(self.tmp.name) / "test.db")
+        self.store = SnapshotStore(self.db)
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _seed(self, store: SnapshotStore, n: int = 20) -> None:
+        for i in range(n):
+            store.insert_snapshot(
+                ts=f"2026-09-02T00:{i:02d}:00+00:00", block_height=965100 + i,
+                count=80_000 + i * 100, vsize=40_000_000 + i * 100_000,
+                total_fee=8_000_000 + i, fastest_fee=2 + i % 3,
+                half_hour_fee=1 + i % 2, hour_fee=1, economy_fee=1,
+                minimum_fee=1,
+            )
+
+    def test_render_chart_produces_png(self):
+        import matplotlib
+        matplotlib.use("Agg")
+        from mempool_monitor.chart import render_chart
+        from PIL import Image
+
+        self._seed(self.store)
+        out = Path(self.tmp.name) / "chart.png"
+        result = render_chart(self.store, out)
+        self.assertTrue(result.is_file())
+        self.assertGreater(result.stat().st_size, 1000)
+        img = Image.open(out)
+        self.assertEqual(img.format, "PNG")
+
+    def test_render_chart_empty_raises(self):
+        import matplotlib
+        matplotlib.use("Agg")
+        from mempool_monitor.chart import render_chart
+
+        with self.assertRaises(ValueError):
+            render_chart(self.store, Path(self.tmp.name) / "empty.png")
 
 
 if __name__ == "__main__":

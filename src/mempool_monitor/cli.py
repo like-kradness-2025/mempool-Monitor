@@ -127,6 +127,19 @@ def cmd_history(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_chart(args: argparse.Namespace) -> int:
+    """Render a PNG chart of stored snapshots."""
+    from .chart import render_chart
+
+    store = SnapshotStore(args.db)
+    try:
+        out = render_chart(store, args.out, limit=args.limit)
+    finally:
+        store.close()
+    print(f"chart written: {out}")
+    return 0
+
+
 def _row_line(row) -> str:
     return (
         f"[{row['ts']}] height={row['block_height']} txs={row['count']:,} "
@@ -161,6 +174,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_hist.add_argument("--limit", type=int, default=24)
     p_hist.add_argument("--json", action="store_true")
     p_hist.set_defaults(func=cmd_history)
+
+    p_chart = sub.add_parser("chart", help="Render snapshot history to a PNG")
+    p_chart.add_argument("--out", default="~/.mempool-monitor/mempool_chart.png")
+    p_chart.add_argument("--limit", type=int, default=500)
+    p_chart.set_defaults(func=cmd_chart)
 
     return parser
 

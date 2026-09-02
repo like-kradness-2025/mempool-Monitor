@@ -82,3 +82,37 @@ class SanityFilterTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ChartSpikeFilterTest(unittest.TestCase):
+    """Display-time spike filter in chart.py (does not touch the DB)."""
+
+    def _mk(self, ts: int, vsize: int, count: int = 85000) -> Snapshot:
+        return _mk(ts, count, vsize)  # reuse helper
+
+    def test_isolated_spike_removed(self):
+        from mempool_monitor.chart import _remove_isolated_spikes
+        snaps = [self._mk(100, 42_000_000), self._mk(200, 37_000_000), self._mk(300, 42_000_000)]
+        out = _remove_isolated_spikes(snaps)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[0].collected_at, 100)
+        self.assertEqual(out[1].collected_at, 300)
+
+    def test_consecutive_drop_kept(self):
+        from mempool_monitor.chart import _remove_isolated_spikes
+        snaps = [self._mk(100, 42_000_000), self._mk(200, 37_000_000),
+                 self._mk(300, 37_000_000), self._mk(400, 42_000_000)]
+        out = _remove_isolated_spikes(snaps)
+        self.assertEqual(len(out), 4)  # real drain: keep all
+
+    def test_smooth_change_kept(self):
+        from mempool_monitor.chart import _remove_isolated_spikes
+        snaps = [self._mk(100, 43_000_000), self._mk(200, 42_500_000), self._mk(300, 42_000_000)]
+        out = _remove_isolated_spikes(snaps)
+        self.assertEqual(len(out), 3)
+
+    def test_short_series_untouched(self):
+        from mempool_monitor.chart import _remove_isolated_spikes
+        snaps = [self._mk(100, 42_000_000), self._mk(200, 37_000_000)]
+        out = _remove_isolated_spikes(snaps)
+        self.assertEqual(len(out), 2)

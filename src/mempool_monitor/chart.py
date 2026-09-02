@@ -17,6 +17,29 @@ JST = ZoneInfo("Asia/Tokyo")
 # ── helper ──────────────────────────────────────────────────────────────
 
 
+def _remove_isolated_spikes(snapshots: list[Snapshot]) -> list[Snapshot]:
+    """Drop display spikes: vsize deviates >10% from BOTH neighbours while
+    the neighbours agree within 6% (isolated CDN glitch, not a real move).
+    """
+    ordered = sorted(snapshots, key=lambda s: s.collected_at)
+    if len(ordered) < 3:
+        return ordered
+    kept: list[Snapshot] = []
+    for i, s in enumerate(ordered):
+        if 0 < i < len(ordered) - 1:
+            prev_v = ordered[i - 1].mempool_vsize
+            next_v = ordered[i + 1].mempool_vsize
+            cur_v = s.mempool_vsize
+            if prev_v > 0 and next_v > 0:
+                nbr_agree = abs(prev_v - next_v) / max(prev_v, next_v) < 0.06
+                dev_prev = abs(cur_v - prev_v) / prev_v
+                dev_next = abs(cur_v - next_v) / next_v
+                if nbr_agree and dev_prev > 0.10 and dev_next > 0.10:
+                    continue  # drop isolated spike
+        kept.append(s)
+    return kept
+
+
 def _plot_nonans(axis, times, values, **kwargs):
     """Plot values on *axis*, skipping any None/NaN entries."""
     arr = np.array([v if v is not None else np.nan for v in values])
@@ -51,6 +74,12 @@ def generate_chart(snapshots: list[Snapshot], output: str | Path) -> Path:
     """
     if not snapshots:
         raise ValueError("at least one snapshot is required to generate a chart")
+
+    # ── remove isolated stale-CDN spikes for display ────────────────────
+    # A snapshot whose vsize deviates >18% from both neighbours (which agree
+    # with each other) is a CDN glitch, not a real mempool move.  Filter for
+    # display only; the DB keeps the raw reading.
+    snapshots = _remove_isolated_spikes(snapshots)
 
     # ── prepare data ────────────────────────────────────────────────────
     snapshots = sorted(snapshots, key=lambda s: s.collected_at)

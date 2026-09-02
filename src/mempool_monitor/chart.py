@@ -18,7 +18,7 @@ JST = ZoneInfo("Asia/Tokyo")
 
 
 def _remove_isolated_spikes(snapshots: list[Snapshot]) -> list[Snapshot]:
-    """Drop display spikes: vsize deviates >10% from BOTH neighbours while
+    """Drop display spikes: vsize deviates >8% from BOTH neighbours while
     the neighbours agree within 6% (isolated CDN glitch, not a real move).
     """
     ordered = sorted(snapshots, key=lambda s: s.collected_at)
@@ -34,7 +34,7 @@ def _remove_isolated_spikes(snapshots: list[Snapshot]) -> list[Snapshot]:
                 nbr_agree = abs(prev_v - next_v) / max(prev_v, next_v) < 0.06
                 dev_prev = abs(cur_v - prev_v) / prev_v
                 dev_next = abs(cur_v - next_v) / next_v
-                if nbr_agree and dev_prev > 0.10 and dev_next > 0.10:
+                if nbr_agree and dev_prev > 0.08 and dev_next > 0.08:
                     continue  # drop isolated spike
         kept.append(s)
     return kept

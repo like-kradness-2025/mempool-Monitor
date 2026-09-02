@@ -18,24 +18,36 @@ JST = ZoneInfo("Asia/Tokyo")
 
 
 def _remove_isolated_spikes(snapshots: list[Snapshot]) -> list[Snapshot]:
-    """Drop display spikes: vsize deviates >8% from BOTH neighbours while
-    the neighbours agree within 6% (isolated CDN glitch, not a real move).
+    """Drop display spikes using a rolling-median band.
+
+    1-minute mempool size data shows sharp V-dips from two sources:
+      1. CDN glitches (stale /api/mempool responses, no block mined)
+      2. Block-confirmation dips (a block is mined, mempool drains, then
+         new txs refill within a minute or two)
+
+    Both are visually identical spikes at this resolution and neither
+    represents a sustained trend, so we drop any sample whose vsize is
+    more than 7% away from the local rolling median (window 11).  Longer
+    drains (many consecutive low samples) shift the median and survive.
     """
     ordered = sorted(snapshots, key=lambda s: s.collected_at)
-    if len(ordered) < 3:
+    n = len(ordered)
+    if n < 5:
         return ordered
+
+    vsizes = [s.mempool_vsize for s in ordered]
     kept: list[Snapshot] = []
+    half = 5  # window 11 -> 5 each side
     for i, s in enumerate(ordered):
-        if 0 < i < len(ordered) - 1:
-            prev_v = ordered[i - 1].mempool_vsize
-            next_v = ordered[i + 1].mempool_vsize
-            cur_v = s.mempool_vsize
-            if prev_v > 0 and next_v > 0:
-                nbr_agree = abs(prev_v - next_v) / max(prev_v, next_v) < 0.06
-                dev_prev = abs(cur_v - prev_v) / prev_v
-                dev_next = abs(cur_v - next_v) / next_v
-                if nbr_agree and dev_prev > 0.08 and dev_next > 0.08:
-                    continue  # drop isolated spike
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        window = sorted(vsizes[lo:i] + vsizes[i + 1:hi])
+        if not window:
+            kept.append(s)
+            continue
+        med = window[len(window) // 2]
+        if med > 0 and abs(s.mempool_vsize - med) / med > 0.07:
+            continue  # deviates >7% from local baseline -> drop
         kept.append(s)
     return kept
 

@@ -24,7 +24,8 @@ def main() -> int:
     env["MPLBACKEND"] = "Agg"
 
     rc = subprocess.run(
-        [PYTHON, "-m", "mempool_monitor.cli", "chart", "--output", str(out_path)],
+        [PYTHON, "-m", "mempool_monitor.cli", "chart", "--output", str(out_path),
+         "--hours", "3"],
         cwd=REPO_ROOT, env=env, capture_output=True, text=True,
     ).returncode
     if rc != 0:

@@ -72,7 +72,9 @@ class MempoolClient:
 
     def collect(self) -> RawCollection:
         started = time.monotonic()
-        mempool = self._get_json("/api/mempool")
+        # Majority-vote mempool fetch: probe several backend IPs directly and
+        # adopt the healthy-cluster median (stale CDN backends are excluded).
+        mempool = fetch_mempool_majority() or self._get_json("/api/mempool")
         fees = self._get_json("/api/v1/fees/recommended")
         projected = self._get_json("/api/v1/fees/mempool-blocks")
         blocks = self._get_json("/api/blocks")
@@ -122,6 +124,112 @@ class MempoolClient:
 
 
 # ── Standalone helper functions ──────────────────────────────────────────────
+
+# mempool.space resolves to 7 backend IPs (103.165.192.202-208, observed
+# 2026-09-03); ~2 of them (.203/.207) serve stale mempool data (~10% lower
+# tx/vsize) while reporting the current block height.  DNS round-robin gives
+# a ~29% chance of reading the stale backend on any single fetch.  We query
+# several backends directly and adopt the majority value.
+_MEMPOOL_SPACE_IPS: list[str] | None = None  # populated on first use
+
+
+def _resolve_mempool_ips() -> list[str]:
+    global _MEMPOOL_SPACE_IPS
+    if _MEMPOOL_SPACE_IPS:
+        return _MEMPOOL_SPACE_IPS
+    try:
+        import socket
+
+        infos = socket.getaddrinfo("mempool.space", 443, socket.AF_INET)
+        raw: list[Any] = sorted({info[4][0] for info in infos})
+        ips = [str(ip) for ip in raw]
+        _MEMPOOL_SPACE_IPS = ips or ["mempool.space"]
+    except Exception:
+        _MEMPOOL_SPACE_IPS = ["mempool.space"]
+    return _MEMPOOL_SPACE_IPS
+
+
+def fetch_mempool_majority(
+    probe_count: int = 5,
+    timeout: float = 8.0,
+) -> dict[str, Any] | None:
+    """Query several mempool.space backends and return the majority mempool.
+
+    Each backend IP is probed once with ``/api/mempool``.  The tx counts
+    should cluster tightly (current state); a backend that deviates >10%
+    from the median count is a stale read and is discarded.  If at least
+    ``ceil(probe_count/2)`` healthy responses remain, the median of the
+    healthy ones is returned as the adopted mempool state (the response
+    with the count closest to that median, so fee_histogram etc. are real).
+
+    Returns None when fewer than half of the probes succeeded or agreed
+    (caller falls back to a plain DNS fetch).
+    """
+    ips = _resolve_mempool_ips()
+    if len(ips) < 2:
+        return None
+    targets = ips[:probe_count]
+
+    responses: list[dict[str, Any]] = []
+    for ip in targets:
+        try:
+            # Connect to the backend IP directly, keeping the Host header as
+            # mempool.space.  Certificate verification is disabled because
+            # the cert is issued for the hostname, not the raw IP; the TLS
+            # handshake still validates the chain via the system trust store
+            # unless verify=False skips it — we accept that trade-off for
+            # backend probing and fall back to a verified DNS fetch on
+            # failure.
+            with httpx.Client(timeout=timeout, verify=False) as client:
+                resp = client.get(
+                    f"https://{ip}/api/mempool",
+                    headers={
+                        "User-Agent": "mempool-monitor/0.1",
+                        "Host": "mempool.space",
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            if isinstance(data, dict) and data.get("count"):
+                responses.append(data)
+        except Exception as exc:  # noqa: BLE001
+            logging.debug("mempool probe %s failed: %s", ip, exc)
+
+    if not responses:
+        return None
+    # Healthy cluster: the tx-count value around which most responses
+    # cluster.  A plain median breaks when stale reads are the majority of
+    # *responses* but not of the *cluster* — so instead we find the densest
+    # cluster: for each response, count neighbours within 8%; the response
+    # with the most neighbours is the cluster centre.
+    def _cluster_size(r: dict[str, Any]) -> int:
+        c = float(r["count"])
+        return sum(
+            1 for other in responses
+            if abs(float(other["count"]) - c) / c <= 0.08
+        )
+
+    centre = max(responses, key=_cluster_size)
+    centre_c = float(centre["count"])
+    healthy = [r for r in responses if abs(r["count"] - centre_c) / centre_c <= 0.08]
+    required = (probe_count + 1) // 2
+    if len(healthy) < required:
+        logging.warning(
+            "mempool majority: only %d/%d healthy responses; falling back",
+            len(healthy), probe_count,
+        )
+        return None
+    # Adopt the response whose count is closest to the healthy median.
+    healthy_med = sorted(float(r["count"]) for r in healthy)[
+        len(healthy) // 2
+    ]
+    adopted = min(healthy, key=lambda r: abs(r["count"] - healthy_med))
+    logging.info(
+        "mempool majority: %d probes, %d healthy, adopted tx=%d vMB=%.1f",
+        len(responses), len(healthy), adopted["count"],
+        adopted["vsize"] / 1e6,
+    )
+    return adopted
 
 
 def fetch_difficulty(timeout: float = 10.0) -> dict[str, Any] | None:

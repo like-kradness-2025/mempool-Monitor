@@ -60,9 +60,14 @@ class SanityFilterTest(unittest.TestCase):
         self.assertFalse(is_plausible(snap, PREV, RECENT))
 
     def test_chain_tip_advance_allows_real_drain(self):
-        # Block confirmed -> genuine large drop passes
-        snap = _mk(300, 60_000, 35_000_000, height=965_201)
+        # Block confirmed -> a genuine ~11% drain passes (wider band)
+        snap = _mk(300, 76_000, 38_000_000, height=965_201)
         self.assertTrue(is_plausible(snap, PREV, RECENT))
+
+    def test_chain_tip_advance_oversized_drop_rejected(self):
+        # One block cannot drain >15%; an 18% drop is still a CDN read
+        snap = _mk(300, 60_000, 35_000_000, height=965_201)
+        self.assertFalse(is_plausible(snap, PREV, RECENT))
 
     def test_first_snapshot_always_accepted(self):
         snap = _mk(1, 88_000, 43_000_000)
@@ -75,8 +80,8 @@ class SanityFilterTest(unittest.TestCase):
     def test_height_change_within_recent_accepted(self):
         # current height matches recent max (block confirmed between ticks)
         mixed = [_mk(100 + i, 87_000, 43_000_000, height=965_200 + (i % 2)) for i in range(7)]
-        # recent max = 965201; current at 965201 with a real drain after a block
-        snap = _mk(300, 62_000, 36_000_000, height=965_202)
+        # recent max = 965201; current at 965202 with a real drain after a block
+        snap = _mk(300, 76_000, 38_000_000, height=965_202)
         self.assertTrue(is_plausible(snap, mixed[-1], mixed))
 
 
@@ -92,11 +97,12 @@ class ChartSpikeFilterTest(unittest.TestCase):
 
     def test_isolated_spike_removed(self):
         from mempool_monitor.chart import _remove_isolated_spikes
-        snaps = [self._mk(100, 42_000_000), self._mk(200, 37_000_000), self._mk(300, 42_000_000)]
+        # 11+ samples so the rolling-median window engages
+        base = [self._mk(100 + i * 60, 42_000_000) for i in range(12)]
+        snaps = base[:6] + [self._mk(9990, 37_000_000)] + base[6:9]
         out = _remove_isolated_spikes(snaps)
-        self.assertEqual(len(out), 2)
-        self.assertEqual(out[0].collected_at, 100)
-        self.assertEqual(out[1].collected_at, 300)
+        self.assertEqual(len(out), len(snaps) - 1)
+        self.assertNotIn(9990, [s.collected_at for s in out])
 
     def test_consecutive_drop_kept(self):
         from mempool_monitor.chart import _remove_isolated_spikes

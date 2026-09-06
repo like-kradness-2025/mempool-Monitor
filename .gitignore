@@ -13,3 +13,4 @@ venv/
 *.sqlite3
 .mempool-monitor/
 charts/*.png
+.serena/

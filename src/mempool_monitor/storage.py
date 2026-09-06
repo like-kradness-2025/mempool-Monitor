@@ -421,7 +421,8 @@ class Storage:
         window): rebuilding a large legacy DB can exceed that window, and a
         killed rebuild would leave the file oversized while the next tick
         prunes another 30% of history.  Call this from a maintenance path
-        (e.g. the ``prune`` CLI) instead.
+        (e.g. the ``prune`` CLI) instead.  Clears the ``size_pruned_at``
+        marker so size-limit pruning re-arms after the file is reclaimed.
 
         SQLite auto_vacuum mode values: 0=NONE, 1=FULL, 2=INCREMENTAL.
         - INCREMENTAL: run PRAGMA incremental_vacuum and consume the full
@@ -438,12 +439,28 @@ class Storage:
         else:
             self.connection.execute("VACUUM")
         self.connection.commit()
+        self.set_state("size_pruned_at", "")
 
     def enforce_size_limit(self, max_bytes: int = 1_000_000_000) -> int:
-        """Check DB size and prune if over limit. Returns number of rows deleted."""
+        """Check DB size and prune if over limit. Returns number of rows deleted.
+
+        Deleting rows does not shrink the main SQLite file (even with
+        incremental auto_vacuum the freed pages are only reclaimed by an
+        explicit vacuum pass).  To avoid pruning another 30% on EVERY tick
+        while the file stays over the limit, a size-triggered prune records
+        ``size_pruned_at`` in runtime_state; further prunes are skipped
+        until ``reclaim_space()`` clears that marker.  Reclamation is the
+        explicit ``prune --vacuum`` maintenance path (kept outside the
+        daemon's 45s collect window on purpose).
+        """
         if self.db_size_bytes() <= max_bytes:
             return 0
-        return self._prune_oldest(0.3)
+        if self.get_state("size_pruned_at"):
+            # Already pruned for an over-limit file; waiting for reclaim.
+            return 0
+        deleted = self._prune_oldest(0.3)
+        self.set_state("size_pruned_at", str(int(time.time())))
+        return deleted
 
     def statistics(self) -> dict[str, Any]:
         snapshot_count = self.connection.execute(

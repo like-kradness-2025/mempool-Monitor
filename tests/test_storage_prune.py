@@ -137,31 +137,32 @@ class ReclaimSpaceTest(unittest.TestCase):
     """reclaim_space honours the DB's auto_vacuum mode (Codex P1 findings)."""
 
     def setUp(self):
-        self.storage = object.__new__(Storage)
-        self.storage.connection = mock.MagicMock()
+        self.storage = object.__new__(Storage)  # type: ignore[attr-defined]
+        self.conn = mock.MagicMock()
+        self.storage.connection = self.conn
 
     def _mode_result(self, mode: int):
         """Configure the connection mock: auto_vacuum pragma -> mode."""
         row = mock.MagicMock()
         row.__getitem__.return_value = mode
-        self.storage.connection.execute.return_value.fetchone.return_value = row
+        self.conn.execute.return_value.fetchone.return_value = row
 
     def test_incremental_mode_consumes_cursor(self):
         # mode 2 = INCREMENTAL -> incremental_vacuum path with cursor consumed.
         self._mode_result(2)
         self.storage.reclaim_space()
-        calls = [c.args[0] for c in self.storage.connection.execute.call_args_list]
+        calls = [c.args[0] for c in self.conn.execute.call_args_list]
         self.assertTrue(any("incremental_vacuum" in c for c in calls))
         self.assertFalse(any(c == "VACUUM" for c in calls))
         # The incremental_vacuum cursor must be fully consumed.
-        iv = self.storage.connection.execute.return_value
+        iv = self.conn.execute.return_value
         iv.fetchall.assert_called_once()
 
     def test_none_mode_runs_full_vacuum(self):
         # mode 0 = NONE (legacy DB) -> full VACUUM path.
         self._mode_result(0)
         self.storage.reclaim_space()
-        calls = [c.args[0] for c in self.storage.connection.execute.call_args_list]
+        calls = [c.args[0] for c in self.conn.execute.call_args_list]
         self.assertTrue(any(c == "VACUUM" for c in calls))
         self.assertFalse(any("incremental_vacuum" in c for c in calls))
 
@@ -169,20 +170,62 @@ class ReclaimSpaceTest(unittest.TestCase):
         # enforce_size_limit runs inside the daemon's 45s window: _prune_oldest
         # must NOT call VACUUM/incremental (deferred to reclaim_space).
         self._mode_result(0)
-        self.storage.connection.execute.side_effect = None
-        self.storage.connection.execute.return_value.fetchone.return_value = None
-        # Seed a fake count row then threshold None -> loop skips all tables.
+
         def fake_execute(sql, *args):
             if sql.startswith("SELECT COUNT"):
                 row = mock.MagicMock()
                 row.__getitem__.return_value = 0
                 return mock.MagicMock(fetchone=lambda: row)
             return mock.MagicMock(fetchone=lambda: None)
-        self.storage.connection.execute.side_effect = fake_execute
+        self.conn.execute.side_effect = fake_execute
         self.storage._prune_oldest(0.3)
-        calls = [c.args[0] for c in self.storage.connection.execute.call_args_list]
+        calls = [c.args[0] for c in self.conn.execute.call_args_list]
         self.assertFalse(any("VACUUM" in c for c in calls))
         self.assertFalse(any("incremental_vacuum" in c for c in calls))
+
+    def test_enforce_size_limit_prunes_once_then_waits_for_reclaim(self):
+        # Codex P1: deleting rows does not shrink the file, so without a guard
+        # every tick would prune another 30% while the file stays over limit.
+        # enforce_size_limit must prune once, set size_pruned_at, and skip
+        # further prunes until reclaim_space() clears the marker.
+        calls = {"db_size": 2_000_000_000, "state": {}, "deleted": 0}
+
+        def fake_db_size():
+            return calls["db_size"]
+
+        def fake_get_state(key, default=""):
+            return calls["state"].get(key, default)
+
+        def fake_set_state(key, value):
+            calls["state"][key] = value
+
+        def fake_prune(fraction: float = 0.3) -> int:
+            calls["deleted"] += 1
+            return 100
+
+        self.storage.db_size_bytes = fake_db_size
+        self.storage.get_state = fake_get_state
+        self.storage.set_state = fake_set_state
+        self.storage._prune_oldest = fake_prune
+        self.storage.reclaim_space = mock.MagicMock()
+
+        # First call: over limit, no marker -> prunes and sets marker.
+        self.assertEqual(self.storage.enforce_size_limit(), 100)
+        self.assertEqual(calls["deleted"], 1)
+        self.assertIn("size_pruned_at", calls["state"])
+
+        # Second call: file still over limit, marker set -> NO second prune.
+        self.assertEqual(self.storage.enforce_size_limit(), 0)
+        self.assertEqual(calls["deleted"], 1)  # still only one prune
+
+        # reclaim_space clears the marker; a later over-limit call prunes again.
+        self.storage.reclaim_space.side_effect = lambda: calls["state"].pop(
+            "size_pruned_at", None
+        )
+        self.storage.reclaim_space()
+        self.assertNotIn("size_pruned_at", calls["state"])
+        self.assertEqual(self.storage.enforce_size_limit(), 100)
+        self.assertEqual(calls["deleted"], 2)
 
 
 if __name__ == "__main__":

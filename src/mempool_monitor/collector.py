@@ -229,6 +229,8 @@ def _is_valid_mempool(data: Any) -> bool:
     vsize = data.get("vsize")
     if not _is_real_number(count) or not _is_real_number(vsize):
         return False
+    # _is_real_number guarantees count/vsize are finite non-bool numbers here.
+    assert isinstance(count, (int, float)) and isinstance(vsize, (int, float))
     if count < 0 or vsize < 0:
         return False
     return True

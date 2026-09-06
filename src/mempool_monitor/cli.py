@@ -206,8 +206,9 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("status")
     prune_parser = subparsers.add_parser("prune")
     prune_parser.add_argument(
-        "--retention-days", type=int, default=30,
-        help="Delete snapshots older than this many days (default: 30)",
+        "--retention-days", type=int, default=None,
+        help="Delete snapshots older than this many days (default: "
+             "config.retention_days)",
     )
     prune_parser.add_argument(
         "--vacuum", action="store_true",
@@ -275,8 +276,9 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(payload, ensure_ascii=False, indent=2))
                 return 0
             if args.command == "prune":
-                deleted = storage.prune(args.retention_days)
-                msg = f"pruned {deleted} snapshots older than {args.retention_days}d"
+                retention_days = args.retention_days or config.retention_days
+                deleted = storage.prune(retention_days)
+                msg = f"pruned {deleted} snapshots older than {retention_days}d"
                 if args.vacuum:
                     storage.reclaim_space()
                     msg += " + reclaimed file space"

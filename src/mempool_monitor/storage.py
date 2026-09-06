@@ -28,6 +28,9 @@ class Storage:
         self.close()
 
     def initialize(self) -> None:
+        # auto_vacuum must be set before any table is created (fresh DBs only);
+        # it is ignored on existing DBs. Enables PRAGMA incremental_vacuum later.
+        self.connection.execute("PRAGMA auto_vacuum=INCREMENTAL")
         self.connection.executescript(
             """
             PRAGMA journal_mode=WAL;
@@ -354,41 +357,110 @@ class Storage:
     def db_size_bytes(self) -> int:
         return self.path.stat().st_size
 
+    # Time column used by each prunable table. delivery_log uses attempted_at;
+    # the rest use collected_at. projected_blocks is intentionally absent: it is
+    # CASCADE-deleted when its parent snapshots are pruned, so pruning it by
+    # fraction would over-delete.
+    _TIME_COLUMNS = {
+        "snapshots": "collected_at",
+        "projected_blocks": "collected_at",
+        "delivery_log": "attempted_at",
+        "difficulty": "collected_at",
+        "mining": "collected_at",
+    }
+
     def _prune_oldest(self, fraction: float = 0.3) -> int:
-        """Remove oldest `fraction` of rows from all tables when DB exceeds limit."""
+        """Remove oldest `fraction` of rows from time-series tables when DB exceeds limit.
+
+        The whole prune runs in a single transaction so a failure on any table
+        rolls everything back (no partial prune). projected_blocks is not pruned
+        directly: deleting snapshots cascades to it.
+        """
         total = 0
-        for table in ("snapshots", "projected_blocks", "delivery_log", "difficulty", "mining"):
-            count_row = self.connection.execute(
-                f"SELECT COUNT(*) AS c FROM {table}"
-            ).fetchone()
-            cnt = int(count_row["c"])
-            if cnt == 0:
-                continue
-            keep = int(cnt * (1 - fraction))
-            if keep <= 0:
-                keep = 1
-            threshold_row = self.connection.execute(
-                f"SELECT collected_at FROM {table} ORDER BY collected_at ASC LIMIT 1 OFFSET ?",
-                (max(0, cnt - keep),),
-            ).fetchone()
-            if threshold_row is None:
-                continue
-            threshold = int(threshold_row["collected_at"])
-            with self.connection:
+        with self.connection:
+            for table in ("snapshots", "delivery_log", "difficulty", "mining"):
+                time_col = self._TIME_COLUMNS[table]
+                count_row = self.connection.execute(
+                    f"SELECT COUNT(*) AS c FROM {table}"
+                ).fetchone()
+                cnt = int(count_row["c"])
+                if cnt == 0:
+                    continue
+                keep = int(cnt * (1 - fraction))
+                if keep <= 0:
+                    keep = 1
+                threshold_row = self.connection.execute(
+                    f"SELECT {time_col} FROM {table} "
+                    f"ORDER BY {time_col} ASC LIMIT 1 OFFSET ?",
+                    (max(0, cnt - keep),),
+                ).fetchone()
+                if threshold_row is None:
+                    continue
+                threshold = int(threshold_row[time_col])
                 cursor = self.connection.execute(
-                    f"DELETE FROM {table} WHERE collected_at < ?", (threshold,)
+                    f"DELETE FROM {table} WHERE {time_col} < ?", (threshold,)
                 )
                 total += cursor.rowcount
         if total > 0:
-            self.connection.execute("PRAGMA incremental_vacuum")
+            # Shrink the WAL so the -wal file does not grow unbounded.
+            # NOTE: no VACUUM / incremental_vacuum here — reclaiming freed
+            # pages can take longer than the daemon's 45s collect window on
+            # a large legacy DB, and a half-finished rebuild would leave the
+            # file oversized while the next tick prunes another 30%.  Space
+            # reclamation is a separate, explicit step (reclaim_space),
+            # run outside the timed collection path.
+            self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             self.connection.commit()
         return total
 
+    def reclaim_space(self) -> None:
+        """Explicitly reclaim pages freed by pruning (run OUTSIDE collection).
+
+        Full VACUUM/incremental_vacuum is intentionally not part of
+        ``enforce_size_limit`` (which runs inside the daemon's 45s collect
+        window): rebuilding a large legacy DB can exceed that window, and a
+        killed rebuild would leave the file oversized while the next tick
+        prunes another 30% of history.  Call this from a maintenance path
+        (e.g. the ``prune`` CLI) instead.  Clears the ``size_pruned_at``
+        marker so size-limit pruning re-arms after the file is reclaimed.
+
+        SQLite auto_vacuum mode values: 0=NONE, 1=FULL, 2=INCREMENTAL.
+        - INCREMENTAL: run PRAGMA incremental_vacuum and consume the full
+          cursor (it yields one row per reclaimed page — discarding the
+          cursor after execute() would reclaim only a single page).
+        - NONE/FULL: incremental_vacuum is a no-op (NONE) or unnecessary
+          (FULL auto-vacuums); a full VACUUM rebuilds the file so the freed
+          pages actually shrink db_size_bytes().
+        """
+        mode = self.connection.execute("PRAGMA auto_vacuum").fetchone()[0]
+        if mode == 2:  # INCREMENTAL
+            cursor = self.connection.execute("PRAGMA incremental_vacuum")
+            cursor.fetchall()
+        else:
+            self.connection.execute("VACUUM")
+        self.connection.commit()
+        self.set_state("size_pruned_at", "")
+
     def enforce_size_limit(self, max_bytes: int = 1_000_000_000) -> int:
-        """Check DB size and prune if over limit. Returns number of rows deleted."""
+        """Check DB size and prune if over limit. Returns number of rows deleted.
+
+        Deleting rows does not shrink the main SQLite file (even with
+        incremental auto_vacuum the freed pages are only reclaimed by an
+        explicit vacuum pass).  To avoid pruning another 30% on EVERY tick
+        while the file stays over the limit, a size-triggered prune records
+        ``size_pruned_at`` in runtime_state; further prunes are skipped
+        until ``reclaim_space()`` clears that marker.  Reclamation is the
+        explicit ``prune --vacuum`` maintenance path (kept outside the
+        daemon's 45s collect window on purpose).
+        """
         if self.db_size_bytes() <= max_bytes:
             return 0
-        return self._prune_oldest(0.3)
+        if self.get_state("size_pruned_at"):
+            # Already pruned for an over-limit file; waiting for reclaim.
+            return 0
+        deleted = self._prune_oldest(0.3)
+        self.set_state("size_pruned_at", str(int(time.time())))
+        return deleted
 
     def statistics(self) -> dict[str, Any]:
         snapshot_count = self.connection.execute(

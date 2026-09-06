@@ -42,10 +42,16 @@ def _handle_stop(signum, frame):  # noqa: ARG001
 
 
 def collect_once(env: dict) -> int:
-    result = subprocess.run(
-        [sys.executable, "-m", "mempool_monitor.cli", "collect"],
-        cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=45,
-    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "mempool_monitor.cli", "collect"],
+            cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=45,
+        )
+    except subprocess.TimeoutExpired:
+        # subprocess.run already kills the child on timeout; just log and report
+        # a failure so the loop continues and the failure counter increments.
+        _log("collect timed out after 45s")
+        return 1
     if result.returncode != 0:
         _log(f"collect failed (exit {result.returncode}): {result.stderr[-300:]}")
     return result.returncode
@@ -69,7 +75,11 @@ def main() -> int:
     failures = 0
     while RUNNING:
         started = time.monotonic()
-        rc = collect_once(env)
+        try:
+            rc = collect_once(env)
+        except Exception as exc:  # noqa: BLE001 - never let the loop die
+            _log(f"collect_once raised unexpected {type(exc).__name__}: {exc}")
+            rc = 1
         if rc == 0:
             failures = 0
         else:

@@ -95,14 +95,18 @@ class ChartSpikeFilterTest(unittest.TestCase):
     def _mk(self, ts: int, vsize: int, count: int = 85000) -> Snapshot:
         return _mk(ts, count, vsize)  # reuse helper
 
-    def test_isolated_spike_removed(self):
+    def test_isolated_spike_masked_not_removed(self):
         from mempool_monitor.chart import _remove_isolated_spikes
-        # 11+ samples so the rolling-median window engages
+        import math
+        # 13 samples with the spike mid-series (window 11 engages, and the
+        # spike is not the newest sample so it is eligible for masking).
         base = [self._mk(100 + i * 60, 42_000_000) for i in range(12)]
-        snaps = base[:6] + [self._mk(9990, 37_000_000)] + base[6:9]
+        snaps = base[:6] + [self._mk(430, 37_000_000)] + base[6:]
         out = _remove_isolated_spikes(snaps)
-        self.assertEqual(len(out), len(snaps) - 1)
-        self.assertNotIn(9990, [s.collected_at for s in out])
+        # New contract: objects are never dropped, only the vsize is NaN-masked.
+        self.assertEqual(len(out), len(snaps))
+        spike = next(s for s in out if s.collected_at == 430)
+        self.assertTrue(math.isnan(spike.mempool_vsize))
 
     def test_consecutive_drop_kept(self):
         from mempool_monitor.chart import _remove_isolated_spikes
@@ -122,3 +126,28 @@ class ChartSpikeFilterTest(unittest.TestCase):
         snaps = [self._mk(100, 42_000_000), self._mk(200, 37_000_000)]
         out = _remove_isolated_spikes(snaps)
         self.assertEqual(len(out), 2)
+
+    def test_newest_never_masked(self):
+        from mempool_monitor.chart import _remove_isolated_spikes
+        import math
+        # A genuine latest dip (newest sample is the low one) must survive as-is.
+        base = [self._mk(100 + i * 60, 42_000_000) for i in range(12)]
+        snaps = base + [self._mk(820, 37_000_000)]
+        out = _remove_isolated_spikes(snaps)
+        newest = out[-1]
+        self.assertEqual(newest.collected_at, 820)
+        self.assertFalse(math.isnan(newest.mempool_vsize))
+
+    def test_other_fields_survive_mask(self):
+        from dataclasses import replace
+        from mempool_monitor.chart import _remove_isolated_spikes
+        import math
+        # vsize spike must not erase the snapshot's other panel fields.
+        base = [self._mk(100 + i * 60, 42_000_000) for i in range(12)]
+        snaps = [replace(s, btc_price_usd=67_000.0) for s in base]
+        spike_snap = replace(self._mk(430, 37_000_000), btc_price_usd=67_000.0)
+        snaps = snaps[:6] + [spike_snap] + snaps[6:]
+        out = _remove_isolated_spikes(snaps)
+        spike = next(s for s in out if s.collected_at == 430)
+        self.assertTrue(math.isnan(spike.mempool_vsize))
+        self.assertEqual(spike.mempool_count, 85000)  # other fields intact

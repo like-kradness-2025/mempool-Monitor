@@ -15,6 +15,11 @@ clusters):
 
 Dry-run by default; pass --apply to delete.
 
+!!! WARNING — already applied once (2026-09-03, 129 rows). The DB is now
+    majority-vote clean; DO NOT re-run --apply on the live DB without a
+    fresh backup and a dry-run review first.  Historical cleanup scripts
+    are kept for audit, not for re-execution.
+
 Usage: python3 scripts/clean_pre_majority.py [--apply] [--until TS]
 """
 from __future__ import annotations
@@ -84,8 +89,11 @@ def main() -> int:
         stale = [r for r in stale if r["mempool_vsize"] < 40_000_000]
         if not stale:
             continue
-        # Only delete when the median cluster holds the majority.
-        if len(keep) < len(group) / 2:
+        # Only delete when the median cluster holds a STRICT majority
+        # (>50%).  With an even group, exactly half is NOT a majority —
+        # a 2:2 bimodal split has no majority and must not delete either
+        # side (either cluster could be the real state).
+        if len(keep) * 2 <= len(group):
             continue
         if len(keep) < 2:
             continue

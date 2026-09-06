@@ -76,3 +76,41 @@ def is_plausible(
     if count_dev > cnt_limit or vsize_dev > vsz_limit:
         return False
     return True
+
+
+def is_suspect(
+    current: Snapshot,
+    previous: Snapshot | None,
+    recent: list[Snapshot] | None = None,
+) -> bool:
+    """Return True when *current* deviates beyond the plausibility band.
+
+    This is the inverse of :func:`is_plausible` re-encoded under a clear
+    name so the collector can flag a twice-rejected read as suspect data
+    instead of silently storing it as a normal sample.  A snapshot with no
+    reference history is not suspect (nothing to compare against).
+    """
+    refs: list[Snapshot] = []
+    if recent:
+        refs = [s for s in recent if s is not None]
+    if previous is not None and previous not in refs:
+        refs.append(previous)
+    refs = refs[-RECENT_WINDOW:]
+    if not refs:
+        return False
+
+    med_count = _median([float(s.mempool_count) for s in refs])
+    med_vsize = _median([float(s.mempool_vsize) for s in refs])
+    if med_count <= 0 or med_vsize <= 0:
+        return False
+
+    height_advanced = (
+        previous is not None
+        and current.latest_block_height > previous.latest_block_height
+    )
+    cnt_limit = WIDE_COUNT_DEV_RATIO if height_advanced else MAX_COUNT_DEV_RATIO
+    vsz_limit = WIDE_VSIZE_DEV_RATIO if height_advanced else MAX_VSIZE_DEV_RATIO
+
+    count_dev = abs(current.mempool_count - med_count) / med_count
+    vsize_dev = abs(current.mempool_vsize - med_vsize) / med_vsize
+    return count_dev > cnt_limit or vsize_dev > vsz_limit

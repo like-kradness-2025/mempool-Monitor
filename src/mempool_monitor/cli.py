@@ -204,7 +204,17 @@ def build_parser() -> argparse.ArgumentParser:
     report_parser = subparsers.add_parser("report")
     report_parser.add_argument("--send", action="store_true")
     subparsers.add_parser("status")
-    subparsers.add_parser("prune")
+    prune_parser = subparsers.add_parser("prune")
+    prune_parser.add_argument(
+        "--retention-days", type=int, default=None,
+        help="Delete snapshots older than this many days (default: "
+             "config.retention_days)",
+    )
+    prune_parser.add_argument(
+        "--vacuum", action="store_true",
+        help="Also reclaim freed file space (VACUUM/incremental). Run outside "
+             "the timed collect path — can be slow on large DBs.",
+    )
     return parser
 
 
@@ -266,7 +276,13 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(payload, ensure_ascii=False, indent=2))
                 return 0
             if args.command == "prune":
-                print(storage.prune(config.retention_days))
+                retention_days = args.retention_days or config.retention_days
+                deleted = storage.prune(retention_days)
+                msg = f"pruned {deleted} snapshots older than {retention_days}d"
+                if args.vacuum:
+                    storage.reclaim_space()
+                    msg += " + reclaimed file space"
+                print(msg)
                 return 0
     except Exception as exc:
         print(mask_secrets(str(exc)), file=sys.stderr)

@@ -6,7 +6,7 @@ btc-discord.mjs. This is a standalone sender script so the Hermes cron job can
 call it directly.
 
 Usage:
-  python3 send_mempool_discord.py [--out PATH] [--limit N] [--hours N]
+  python3 send_mempool_discord.py [--out PATH] [--hours N]
 
 Environment:
   MEMPOOL_DB   SQLite path (default ~/.mempool-monitor/mempool.db)
@@ -34,21 +34,28 @@ MESSAGE = "BTC Mempool Monitor | mempool.space"
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate + deliver mempool chart")
-    parser.add_argument("--out", default=str(CHARTS_DIR / "mempool_chart_latest.png"))
-    parser.add_argument("--limit", type=int, default=500)
+    parser.add_argument("--out", "--output", dest="output",
+                        default=str(CHARTS_DIR / "mempool_chart_latest.png"),
+                        help="Output PNG path (--out and --output both accepted)")
+    parser.add_argument(
+        "--hours", type=int, default=None,
+        help="Hours of history (default: config.chart_hours)",
+    )
     parser.add_argument("--webhook", default=WEBHOOK)
     parser.add_argument("--message", default=MESSAGE)
     args = parser.parse_args()
 
-    out_path = Path(args.out).expanduser()
+    out_path = Path(args.output).expanduser()
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Use the same python that has matplotlib
     python = sys.executable
     plot_cmd = [
         python, "-m", "mempool_monitor.cli", "chart",
-        "--out", str(out_path), "--limit", str(args.limit),
+        "--output", str(out_path),
     ]
+    if args.hours is not None:
+        plot_cmd += ["--hours", str(args.hours)]
     env = dict(os.environ)
     env["PYTHONPATH"] = str(SRC)
 

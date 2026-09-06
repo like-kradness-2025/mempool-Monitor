@@ -55,6 +55,13 @@ def main() -> int:
         r = rows[i]
         if r["latest_block_height"] == newest:
             continue
+        # Height-guard: the dip must sit INSIDE one block height (same
+        # height as both neighbours).  A drop that coincides with a height
+        # change is a real post-block drain (block confirmation empties the
+        # mempool) and must never be deleted.
+        if (rows[i - 1]["latest_block_height"] != r["latest_block_height"]
+                or rows[i + 1]["latest_block_height"] != r["latest_block_height"]):
+            continue
         # Local trend from the wide window (excluding self).
         win = [vs[j] for j in range(i - WIDE, i + WIDE + 1) if j != i]
         ordered = sorted(win)
@@ -63,9 +70,11 @@ def main() -> int:
             continue
         # Only delete downward dips (stale reads are always LOW).
         if r["mempool_vsize"] < med * (1 - DOWN_TOL):
-            # Neighbours must sit near the trend (not a real drain edge).
+            # Neighbours must sit near the trend (not a real drain edge)
+            # AND on the same height as the dip.
             near = [j for j in (i - 1, i + 1)
-                    if rows[j]["mempool_vsize"] >= med * (1 - DOWN_TOL)]
+                    if rows[j]["latest_block_height"] == r["latest_block_height"]
+                    and rows[j]["mempool_vsize"] >= med * (1 - DOWN_TOL)]
             if len(near) >= 1:
                 deleted.append(r)
 

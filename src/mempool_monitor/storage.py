@@ -28,6 +28,9 @@ class Storage:
         self.close()
 
     def initialize(self) -> None:
+        # auto_vacuum must be set before any table is created (fresh DBs only);
+        # it is ignored on existing DBs. Enables PRAGMA incremental_vacuum later.
+        self.connection.execute("PRAGMA auto_vacuum=INCREMENTAL")
         self.connection.executescript(
             """
             PRAGMA journal_mode=WAL;
@@ -354,32 +357,53 @@ class Storage:
     def db_size_bytes(self) -> int:
         return self.path.stat().st_size
 
+    # Time column used by each prunable table. delivery_log uses attempted_at;
+    # the rest use collected_at. projected_blocks is intentionally absent: it is
+    # CASCADE-deleted when its parent snapshots are pruned, so pruning it by
+    # fraction would over-delete.
+    _TIME_COLUMNS = {
+        "snapshots": "collected_at",
+        "projected_blocks": "collected_at",
+        "delivery_log": "attempted_at",
+        "difficulty": "collected_at",
+        "mining": "collected_at",
+    }
+
     def _prune_oldest(self, fraction: float = 0.3) -> int:
-        """Remove oldest `fraction` of rows from all tables when DB exceeds limit."""
+        """Remove oldest `fraction` of rows from time-series tables when DB exceeds limit.
+
+        The whole prune runs in a single transaction so a failure on any table
+        rolls everything back (no partial prune). projected_blocks is not pruned
+        directly: deleting snapshots cascades to it.
+        """
         total = 0
-        for table in ("snapshots", "projected_blocks", "delivery_log", "difficulty", "mining"):
-            count_row = self.connection.execute(
-                f"SELECT COUNT(*) AS c FROM {table}"
-            ).fetchone()
-            cnt = int(count_row["c"])
-            if cnt == 0:
-                continue
-            keep = int(cnt * (1 - fraction))
-            if keep <= 0:
-                keep = 1
-            threshold_row = self.connection.execute(
-                f"SELECT collected_at FROM {table} ORDER BY collected_at ASC LIMIT 1 OFFSET ?",
-                (max(0, cnt - keep),),
-            ).fetchone()
-            if threshold_row is None:
-                continue
-            threshold = int(threshold_row["collected_at"])
-            with self.connection:
+        with self.connection:
+            for table in ("snapshots", "delivery_log", "difficulty", "mining"):
+                time_col = self._TIME_COLUMNS[table]
+                count_row = self.connection.execute(
+                    f"SELECT COUNT(*) AS c FROM {table}"
+                ).fetchone()
+                cnt = int(count_row["c"])
+                if cnt == 0:
+                    continue
+                keep = int(cnt * (1 - fraction))
+                if keep <= 0:
+                    keep = 1
+                threshold_row = self.connection.execute(
+                    f"SELECT {time_col} FROM {table} "
+                    f"ORDER BY {time_col} ASC LIMIT 1 OFFSET ?",
+                    (max(0, cnt - keep),),
+                ).fetchone()
+                if threshold_row is None:
+                    continue
+                threshold = int(threshold_row[time_col])
                 cursor = self.connection.execute(
-                    f"DELETE FROM {table} WHERE collected_at < ?", (threshold,)
+                    f"DELETE FROM {table} WHERE {time_col} < ?", (threshold,)
                 )
                 total += cursor.rowcount
         if total > 0:
+            # Outside the transaction above: shrink the WAL and reclaim freed pages.
+            self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             self.connection.execute("PRAGMA incremental_vacuum")
             self.connection.commit()
         return total

@@ -75,10 +75,22 @@ def main() -> int:
                 # sample before/after).  A real drain keeps falling and
                 # the height advances; a stale run sits under a trend at
                 # the SAME height and bounces back.  Require the samples
-                # AROUND the run to be clearly higher than the run.
-                before = rows[i - 1]["mempool_vsize"] if i > 0 else None
-                after = rows[j]["mempool_vsize"] if j < n else None
-                hi = max(v for v in (before, after) if v)
+                # AROUND the run to be clearly higher than the run AND on
+                # the same block height — a run that ends in a height
+                # change is a real post-block drain, never delete it.
+                before = rows[i - 1] if i > 0 else None
+                after = rows[j] if j < n else None
+                same_h = all(
+                    nb is not None
+                    and nb["latest_block_height"] == rows[i]["latest_block_height"]
+                    for nb in (before, after)
+                )
+                if not same_h:
+                    i = j
+                    continue
+                before_v = before["mempool_vsize"] if before else None
+                after_v = after["mempool_vsize"] if after else None
+                hi = max(v for v in (before_v, after_v) if v)
                 run_hi = max(r["mempool_vsize"] for r in run)
                 if hi > 0 and hi * (1 - DOWN_TOL) > run_hi:
                     deleted.extend(run)

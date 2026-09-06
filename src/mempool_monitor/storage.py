@@ -402,26 +402,34 @@ class Storage:
                 )
                 total += cursor.rowcount
         if total > 0:
-            # Outside the transaction above: shrink the WAL and reclaim freed
-            # pages.  auto_vacuum is only INCREMENTAL on databases created
-            # after this setting shipped; existing DBs stay NONE and must be
-            # fully VACUUMed instead (incremental_vacuum is a no-op there).
+            # Shrink the WAL so the -wal file does not grow unbounded.
+            # NOTE: no VACUUM / incremental_vacuum here — reclaiming freed
+            # pages can take longer than the daemon's 45s collect window on
+            # a large legacy DB, and a half-finished rebuild would leave the
+            # file oversized while the next tick prunes another 30%.  Space
+            # reclamation is a separate, explicit step (reclaim_space),
+            # run outside the timed collection path.
             self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            self._reclaim_space()
             self.connection.commit()
         return total
 
-    def _reclaim_space(self) -> None:
-        """Reclaim pages freed by a prune, honouring the DB's auto_vacuum mode.
+    def reclaim_space(self) -> None:
+        """Explicitly reclaim pages freed by pruning (run OUTSIDE collection).
 
-        SQLite mode values: 0=NONE, 1=FULL, 2=INCREMENTAL.
+        Full VACUUM/incremental_vacuum is intentionally not part of
+        ``enforce_size_limit`` (which runs inside the daemon's 45s collect
+        window): rebuilding a large legacy DB can exceed that window, and a
+        killed rebuild would leave the file oversized while the next tick
+        prunes another 30% of history.  Call this from a maintenance path
+        (e.g. the ``prune`` CLI) instead.
+
+        SQLite auto_vacuum mode values: 0=NONE, 1=FULL, 2=INCREMENTAL.
         - INCREMENTAL: run PRAGMA incremental_vacuum and consume the full
           cursor (it yields one row per reclaimed page — discarding the
           cursor after execute() would reclaim only a single page).
         - NONE/FULL: incremental_vacuum is a no-op (NONE) or unnecessary
           (FULL auto-vacuums); a full VACUUM rebuilds the file so the freed
-          pages actually shrink db_size_bytes().  Runs only after a prune
-          deleted rows (size-limit crossing is rare).
+          pages actually shrink db_size_bytes().
         """
         mode = self.connection.execute("PRAGMA auto_vacuum").fetchone()[0]
         if mode == 2:  # INCREMENTAL
@@ -429,6 +437,7 @@ class Storage:
             cursor.fetchall()
         else:
             self.connection.execute("VACUUM")
+        self.connection.commit()
 
     def enforce_size_limit(self, max_bytes: int = 1_000_000_000) -> int:
         """Check DB size and prune if over limit. Returns number of rows deleted."""

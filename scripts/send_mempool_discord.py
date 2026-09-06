@@ -34,7 +34,9 @@ MESSAGE = "BTC Mempool Monitor | mempool.space"
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate + deliver mempool chart")
-    parser.add_argument("--output", default=str(CHARTS_DIR / "mempool_chart_latest.png"))
+    parser.add_argument("--out", "--output", dest="output",
+                        default=str(CHARTS_DIR / "mempool_chart_latest.png"),
+                        help="Output PNG path (--out and --output both accepted)")
     parser.add_argument(
         "--hours", type=int, default=None,
         help="Hours of history (default: config.chart_hours)",

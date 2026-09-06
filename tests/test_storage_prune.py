@@ -134,7 +134,7 @@ class PruneOldestTest(unittest.TestCase):
 
 
 class ReclaimSpaceTest(unittest.TestCase):
-    """_reclaim_space honours the DB's auto_vacuum mode (Codex P1 findings)."""
+    """reclaim_space honours the DB's auto_vacuum mode (Codex P1 findings)."""
 
     def setUp(self):
         self.storage = object.__new__(Storage)
@@ -149,7 +149,7 @@ class ReclaimSpaceTest(unittest.TestCase):
     def test_incremental_mode_consumes_cursor(self):
         # mode 2 = INCREMENTAL -> incremental_vacuum path with cursor consumed.
         self._mode_result(2)
-        self.storage._reclaim_space()
+        self.storage.reclaim_space()
         calls = [c.args[0] for c in self.storage.connection.execute.call_args_list]
         self.assertTrue(any("incremental_vacuum" in c for c in calls))
         self.assertFalse(any(c == "VACUUM" for c in calls))
@@ -160,9 +160,28 @@ class ReclaimSpaceTest(unittest.TestCase):
     def test_none_mode_runs_full_vacuum(self):
         # mode 0 = NONE (legacy DB) -> full VACUUM path.
         self._mode_result(0)
-        self.storage._reclaim_space()
+        self.storage.reclaim_space()
         calls = [c.args[0] for c in self.storage.connection.execute.call_args_list]
         self.assertTrue(any(c == "VACUUM" for c in calls))
+        self.assertFalse(any("incremental_vacuum" in c for c in calls))
+
+    def test_prune_oldest_does_not_vacuum(self):
+        # enforce_size_limit runs inside the daemon's 45s window: _prune_oldest
+        # must NOT call VACUUM/incremental (deferred to reclaim_space).
+        self._mode_result(0)
+        self.storage.connection.execute.side_effect = None
+        self.storage.connection.execute.return_value.fetchone.return_value = None
+        # Seed a fake count row then threshold None -> loop skips all tables.
+        def fake_execute(sql, *args):
+            if sql.startswith("SELECT COUNT"):
+                row = mock.MagicMock()
+                row.__getitem__.return_value = 0
+                return mock.MagicMock(fetchone=lambda: row)
+            return mock.MagicMock(fetchone=lambda: None)
+        self.storage.connection.execute.side_effect = fake_execute
+        self.storage._prune_oldest(0.3)
+        calls = [c.args[0] for c in self.storage.connection.execute.call_args_list]
+        self.assertFalse(any("VACUUM" in c for c in calls))
         self.assertFalse(any("incremental_vacuum" in c for c in calls))
 
 

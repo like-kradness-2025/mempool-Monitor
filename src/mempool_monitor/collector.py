@@ -47,12 +47,15 @@ class MempoolClient:
         )
 
     def _is_public_mempool_space(self) -> bool:
-        """True when the configured base URL targets the public mempool.space.
+        """True when the configured base URL targets the public mempool.space apex.
 
-        The majority-vote probe list is resolved from the public
-        mempool.space DNS, so it is only meaningful when the client really
-        talks to that host.  A custom base_url (self-hosted mirror, test
-        transport, ...) must bypass the vote.
+        The majority-vote probe list is resolved from the apex mempool.space
+        DNS and sends ``Host: mempool.space``, so it is only meaningful when
+        the client really talks to that exact host.  A custom base_url
+        (self-hosted mirror, subdomain deployment, test transport, ...) must
+        bypass the vote — a subdomain could serve a different network, and
+        mixing its fees/blocks with an apex-voted mempool would corrupt the
+        snapshot.
         """
         try:
             from urllib.parse import urlparse
@@ -60,7 +63,7 @@ class MempoolClient:
             host = urlparse(self.config.base_url).hostname or ""
         except Exception:
             return False
-        return host == "mempool.space" or host.endswith(".mempool.space")
+        return host == "mempool.space"
 
     def close(self) -> None:
         self.client.close()

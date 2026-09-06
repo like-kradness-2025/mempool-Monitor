@@ -33,10 +33,7 @@ def _make_fake_get(responses: dict[str, dict]) -> object:
         def __init__(self, *args, **kwargs):
             pass
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
+        def close(self):
             return None
 
         def get(self, url: str, **kwargs) -> FakeResponse:

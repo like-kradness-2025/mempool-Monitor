@@ -268,23 +268,30 @@ def fetch_mempool_majority(
     targets = ips[:probe_count]
 
     responses: list[dict[str, Any]] = []
-    for ip in targets:
-        try:
-            # Connect to the backend IP directly, keeping the Host header
-            # as mempool.space.  We validate the certificate against
-            # mempool.space via the sni_hostname extension while still
-            # connecting to the raw IP: this keeps TLS fully verified
-            # (verify=True, trust_env=False) whereas the previous code
-            # disabled verification entirely.  The trade-off is that we
-            # must supply the Host + SNI ourselves so the handshake
-            # matches mempool.space's cert; on failure we fall back to a
-            # plain verified DNS fetch in the caller.
-            with httpx.Client(
-                timeout=timeout,
-                verify=True,
-                trust_env=False,
-                transport=transport,
-            ) as client:
+    # One client for all probes: a caller-supplied transport must not be
+    # opened/closed per probe (closing a context-managed client closes a
+    # caller-owned transport that enforces closed state, breaking every
+    # subsequent probe).  Without a transport we create our own client for
+    # the loop and close it once at the end.
+    owns_client = transport is None
+    client = httpx.Client(
+        timeout=timeout,
+        verify=True,
+        trust_env=False,
+        transport=transport,
+    )
+    try:
+        for ip in targets:
+            try:
+                # Connect to the backend IP directly, keeping the Host header
+                # as mempool.space.  We validate the certificate against
+                # mempool.space via the sni_hostname extension while still
+                # connecting to the raw IP: this keeps TLS fully verified
+                # (verify=True, trust_env=False) whereas the previous code
+                # disabled verification entirely.  The trade-off is that we
+                # must supply the Host + SNI ourselves so the handshake
+                # matches mempool.space's cert; on failure we fall back to a
+                # plain verified DNS fetch in the caller.
                 resp = client.get(
                     f"https://{ip}/api/mempool",
                     headers={
@@ -295,10 +302,13 @@ def fetch_mempool_majority(
                 )
                 resp.raise_for_status()
                 data = resp.json()
-            if _is_valid_mempool(data):
-                responses.append(data)
-        except Exception as exc:  # noqa: BLE001
-            logging.debug("mempool probe %s failed: %s", ip, exc)
+                if _is_valid_mempool(data):
+                    responses.append(data)
+            except Exception as exc:  # noqa: BLE001
+                logging.debug("mempool probe %s failed: %s", ip, exc)
+    finally:
+        if owns_client:
+            client.close()
 
     if not responses:
         return None

@@ -133,5 +133,38 @@ class PruneOldestTest(unittest.TestCase):
             self.assertEqual(per_snap.get(ts, 0), 2)
 
 
+class ReclaimSpaceTest(unittest.TestCase):
+    """_reclaim_space honours the DB's auto_vacuum mode (Codex P1 findings)."""
+
+    def setUp(self):
+        self.storage = object.__new__(Storage)
+        self.storage.connection = mock.MagicMock()
+
+    def _mode_result(self, mode: int):
+        """Configure the connection mock: auto_vacuum pragma -> mode."""
+        row = mock.MagicMock()
+        row.__getitem__.return_value = mode
+        self.storage.connection.execute.return_value.fetchone.return_value = row
+
+    def test_incremental_mode_consumes_cursor(self):
+        # mode 2 = INCREMENTAL -> incremental_vacuum path with cursor consumed.
+        self._mode_result(2)
+        self.storage._reclaim_space()
+        calls = [c.args[0] for c in self.storage.connection.execute.call_args_list]
+        self.assertTrue(any("incremental_vacuum" in c for c in calls))
+        self.assertFalse(any(c == "VACUUM" for c in calls))
+        # The incremental_vacuum cursor must be fully consumed.
+        iv = self.storage.connection.execute.return_value
+        iv.fetchall.assert_called_once()
+
+    def test_none_mode_runs_full_vacuum(self):
+        # mode 0 = NONE (legacy DB) -> full VACUUM path.
+        self._mode_result(0)
+        self.storage._reclaim_space()
+        calls = [c.args[0] for c in self.storage.connection.execute.call_args_list]
+        self.assertTrue(any(c == "VACUUM" for c in calls))
+        self.assertFalse(any("incremental_vacuum" in c for c in calls))
+
+
 if __name__ == "__main__":
     unittest.main()

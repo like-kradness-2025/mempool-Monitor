@@ -34,7 +34,7 @@ MESSAGE = "BTC Mempool Monitor | mempool.space"
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate + deliver mempool chart")
-    parser.add_argument("--out", default=str(CHARTS_DIR / "mempool_chart_latest.png"))
+    parser.add_argument("--output", default=str(CHARTS_DIR / "mempool_chart_latest.png"))
     parser.add_argument(
         "--hours", type=int, default=None,
         help="Hours of history (default: config.chart_hours)",
@@ -43,14 +43,14 @@ def main() -> int:
     parser.add_argument("--message", default=MESSAGE)
     args = parser.parse_args()
 
-    out_path = Path(args.out).expanduser()
+    out_path = Path(args.output).expanduser()
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Use the same python that has matplotlib
     python = sys.executable
     plot_cmd = [
         python, "-m", "mempool_monitor.cli", "chart",
-        "--out", str(out_path),
+        "--output", str(out_path),
     ]
     if args.hours is not None:
         plot_cmd += ["--hours", str(args.hours)]

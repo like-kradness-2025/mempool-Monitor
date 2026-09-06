@@ -93,14 +93,14 @@ class MempoolClient:
         # Majority-vote mempool fetch: probe several backend IPs directly and
         # adopt the healthy-cluster median (stale CDN backends are excluded).
         # The vote only applies when the effective target really is the
-        # public mempool.space — a self-hosted base_url or an injected test
-        # transport must go through the normal single fetch instead (the
-        # probe list would otherwise point at the wrong host).
+        # public mempool.space AND no test transport was injected — a custom
+        # base_url or a mock transport must go through the normal single
+        # fetch instead (the probe list would otherwise point at the wrong
+        # host, and an injected transport must not receive raw-IP requests
+        # nor be shared across the temporary probe clients).
         mempool: dict[str, Any]
-        if self._is_public_mempool_space():
-            mempool = fetch_mempool_majority(transport=self.transport) or self._get_json(
-                "/api/mempool"
-            )
+        if self._is_public_mempool_space() and self.transport is None:
+            mempool = fetch_mempool_majority() or self._get_json("/api/mempool")
         else:
             mempool = self._get_json("/api/mempool")
         fees = self._get_json("/api/v1/fees/recommended")
@@ -216,7 +216,9 @@ def _is_valid_mempool(data: Any) -> bool:
     A single malformed response (e.g. ``count='100'``, missing ``vsize``,
     or a non-finite value) must not abort the whole majority vote — it is
     simply rejected and the next IP is probed.  ``count == 0`` is valid (a
-    legitimately empty mempool must not be dropped).
+    legitimately empty mempool must not be dropped), but negative values
+    are rejected: a negative vsize used as a cluster centre would make
+    every ratio negative and poison the adopted result.
     """
     if not isinstance(data, dict):
         return False
@@ -224,7 +226,7 @@ def _is_valid_mempool(data: Any) -> bool:
     vsize = data.get("vsize")
     if not _is_real_number(count) or not _is_real_number(vsize):
         return False
-    if count < 0:
+    if count < 0 or vsize < 0:
         return False
     return True
 

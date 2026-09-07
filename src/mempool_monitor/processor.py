@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from .collector import RawCollection
@@ -19,9 +20,20 @@ def _number(data: dict[str, Any], key: str, minimum: float = 0) -> float:
     value = data.get(key)
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise DataValidationError(f"{key} is missing or not numeric")
+    if not math.isfinite(float(value)):
+        raise DataValidationError(f"{key} is not finite")
     if value < minimum:
         raise DataValidationError(f"{key} is below {minimum}")
     return float(value)
+
+
+def _integer(data: dict[str, Any], key: str, minimum: int = 0) -> int:
+    value = data.get(key)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise DataValidationError(f"{key} is missing or not an integer")
+    if value < minimum:
+        raise DataValidationError(f"{key} is below {minimum}")
+    return value
 
 
 def calculate_backlogs(histogram: Any) -> dict[int, float]:
@@ -32,7 +44,12 @@ def calculate_backlogs(histogram: Any) -> dict[int, float]:
         if (
             not isinstance(entry, list)
             or len(entry) != 2
-            or not all(isinstance(item, (int, float)) for item in entry)
+            or not all(
+                isinstance(item, (int, float))
+                and not isinstance(item, bool)
+                and math.isfinite(float(item))
+                for item in entry
+            )
         ):
             raise DataValidationError("fee_histogram contains an invalid entry")
         fee_rate, vsize = float(entry[0]), float(entry[1])
@@ -80,7 +97,7 @@ def process_collection(
         raise DataValidationError("latest block is invalid")
 
     timestamps = [
-        int(_number(block, "timestamp"))
+        _integer(block, "timestamp")
         for block in raw.blocks[:6]
         if isinstance(block, dict)
     ]
@@ -103,28 +120,30 @@ def process_collection(
         hour_fee=_number(raw.fees, "hourFee"),
         economy_fee=_number(raw.fees, "economyFee"),
         minimum_fee=_number(raw.fees, "minimumFee"),
-        mempool_count=int(_number(raw.mempool, "count")),
-        mempool_vsize=int(_number(raw.mempool, "vsize")),
-        mempool_total_fee=int(_number(raw.mempool, "total_fee")),
+        mempool_count=_integer(raw.mempool, "count"),
+        mempool_vsize=_integer(raw.mempool, "vsize"),
+        mempool_total_fee=_integer(raw.mempool, "total_fee"),
         backlog_1=backlogs[1],
         backlog_2=backlogs[2],
         backlog_5=backlogs[5],
         backlog_10=backlogs[10],
         backlog_20=backlogs[20],
         backlog_50=backlogs[50],
-        latest_block_height=int(_number(latest, "height")),
-        latest_block_timestamp=int(_number(latest, "timestamp")),
-        block_age_seconds=max(0, raw.collected_at - int(latest["timestamp"])),
+        latest_block_height=_integer(latest, "height"),
+        latest_block_timestamp=_integer(latest, "timestamp"),
+        block_age_seconds=max(0, raw.collected_at - _integer(latest, "timestamp")),
         avg_block_interval_seconds=sum(intervals) / len(intervals),
-        latest_block_tx_count=int(_number(latest, "tx_count")),
-        latest_block_size=int(_number(latest, "size")),
-        latest_block_weight=int(_number(latest, "weight")),
+        latest_block_tx_count=_integer(latest, "tx_count"),
+        latest_block_size=_integer(latest, "size"),
+        latest_block_weight=_integer(latest, "weight"),
         congestion_level=congestion_level(fastest_fee, backlogs, config),
         provider=config.provider,
         api_latency_ms=raw.latency_ms,
         btc_price_usd=raw.btc_price_usd,
         current_difficulty=raw.current_difficulty,
         current_hashrate=raw.current_hashrate,
+        quality=raw.quality,
+        quality_reason=raw.quality_reason,
     )
 
     projected: list[ProjectedBlock] = []
@@ -137,11 +156,22 @@ def process_collection(
         projected.append(
             ProjectedBlock(
                 position=position,
-                n_tx=int(_number(block, "nTx")),
+                n_tx=_integer(block, "nTx"),
                 block_vsize=_number(block, "blockVSize"),
-                total_fees=int(_number(block, "totalFees")),
+                total_fees=_integer(block, "totalFees"),
                 median_fee=_number(block, "medianFee"),
-                fee_range=[float(value) for value in fee_range],
+                fee_range=[
+                    _validated_fee_range_value(value)
+                    for value in fee_range
+                ],
             )
         )
     return snapshot, projected
+
+
+def _validated_fee_range_value(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise DataValidationError("projected block feeRange contains an invalid value")
+    if not math.isfinite(float(value)) or value < 0:
+        raise DataValidationError("projected block feeRange contains an invalid value")
+    return float(value)

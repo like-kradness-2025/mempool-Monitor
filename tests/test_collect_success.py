@@ -79,6 +79,72 @@ class CollectOnceSuccessTest(unittest.TestCase):
         storage.insert_snapshot.assert_not_called()
         storage.insert_mining.assert_called_once()  # side effect still happens
 
+    def test_mining_auxiliary_failure_does_not_hide_snapshot(self) -> None:
+        storage = self._storage()
+        storage.insert_mining.side_effect = RuntimeError("auxiliary locked")
+        snapshot = MagicMock()
+        snapshot.mempool_count = 84_000
+        snapshot.mempool_vsize = 42_000_000
+        snapshot.congestion_level.name = "LOW"
+        snapshot.fastest_fee = 3.0
+        snapshot.latest_block_height = 800_000
+        raw = MagicMock()
+        raw.current_difficulty = 1e14
+        raw.current_hashrate = 6e20
+
+        with patch("mempool_monitor.collector.MempoolClient") as client_cls, \
+             patch("mempool_monitor.collector.fetch_difficulty", return_value=None):
+            client = MagicMock()
+            client.collect.return_value = raw
+            client.__enter__.return_value = client
+            client_cls.return_value = client
+            with patch(
+                "mempool_monitor.processor.process_collection",
+                return_value=(snapshot, []),
+            ):
+                with patch("mempool_monitor.sanity.is_suspect", return_value=False):
+                    result = collect_once_all(Config(), storage)
+
+        self.assertTrue(result)
+        storage.insert_snapshot.assert_called_once()
+
+    def test_quorum_accepted_snapshot_not_demoted_by_median_sanity(self) -> None:
+        # A real fast drain confirmed by a 7-node quorum must not be demoted
+        # to suspect merely because it deviates from the recent median.
+        storage = self._storage()
+        snapshot = MagicMock()
+        snapshot.mempool_count = 60_000
+        snapshot.mempool_vsize = 30_000_000
+        snapshot.congestion_level.name = "LOW"
+        snapshot.fastest_fee = 3.0
+        snapshot.latest_block_height = 800_000
+        snapshot.quality = "accepted"
+        snapshot.quality_reason = "unique quorum 7/7"
+        raw = MagicMock()
+        raw.current_difficulty = 1e14
+        raw.current_hashrate = 6e20
+        raw.quality = "accepted"
+        raw.quality_reason = "unique quorum 7/7"
+
+        with patch("mempool_monitor.collector.MempoolClient") as client_cls, \
+             patch("mempool_monitor.collector.fetch_difficulty", return_value=None):
+            client = MagicMock()
+            client.collect.return_value = raw
+            client.__enter__.return_value = client
+            client_cls.return_value = client
+            with patch(
+                "mempool_monitor.processor.process_collection",
+                return_value=(snapshot, []),
+            ):
+                with patch("mempool_monitor.sanity.is_suspect", return_value=True):
+                    result = collect_once_all(Config(), storage)
+
+        self.assertTrue(result)
+        storage.insert_snapshot.assert_called_once()
+        stored = storage.insert_snapshot.call_args[0][0]
+        self.assertEqual(stored.quality, "accepted")
+        client.collect.assert_called_once()  # no blind re-fetch for quorum data
+
     def test_difficulty_success_does_not_set_ok(self) -> None:
         # If the main collection fails but difficulty succeeds, ok stays False.
         storage = self._storage()

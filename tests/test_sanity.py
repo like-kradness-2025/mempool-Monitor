@@ -60,9 +60,9 @@ class SanityFilterTest(unittest.TestCase):
         self.assertFalse(is_plausible(snap, PREV, RECENT))
 
     def test_chain_tip_advance_allows_real_drain(self):
-        # Block confirmed -> a genuine ~11% drain passes (wider band)
+        # Height advancement alone does not prove a fresh mempool response.
         snap = _mk(300, 76_000, 38_000_000, height=965_201)
-        self.assertTrue(is_plausible(snap, PREV, RECENT))
+        self.assertFalse(is_plausible(snap, PREV, RECENT))
 
     def test_chain_tip_advance_oversized_drop_rejected(self):
         # One block cannot drain >15%; an 18% drop is still a CDN read
@@ -78,11 +78,11 @@ class SanityFilterTest(unittest.TestCase):
         self.assertFalse(is_plausible(snap, PREV, []))
 
     def test_height_change_within_recent_accepted(self):
-        # current height matches recent max (block confirmed between ticks)
+        # A changed height cannot widen the sanity band without independent
+        # quorum/tip evidence.
         mixed = [_mk(100 + i, 87_000, 43_000_000, height=965_200 + (i % 2)) for i in range(7)]
-        # recent max = 965201; current at 965202 with a real drain after a block
         snap = _mk(300, 76_000, 38_000_000, height=965_202)
-        self.assertTrue(is_plausible(snap, mixed[-1], mixed))
+        self.assertFalse(is_plausible(snap, mixed[-1], mixed))
 
 
 if __name__ == "__main__":

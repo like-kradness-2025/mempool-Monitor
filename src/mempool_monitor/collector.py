@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 import math
 import time
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, replace
+from itertools import combinations
 from typing import Any
 
 import httpx
@@ -33,6 +35,19 @@ class RawCollection:
     btc_price_usd: float | None = None
     current_difficulty: float | None = None
     current_hashrate: float | None = None
+    quality: str = "accepted"
+    quality_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class MempoolRead:
+    """A mempool payload plus the evidence used to accept it."""
+
+    payload: dict[str, Any]
+    quality: str
+    reason: str
+    valid_probes: int
+    quorum_size: int
 
 
 class MempoolClient:
@@ -74,25 +89,40 @@ class MempoolClient:
     def __exit__(self, *args: object) -> None:
         self.close()
 
-    def _get_json(self, path: str) -> Any:
+    def _get_json(self, path: str, deadline: float | None = None) -> Any:
         last_error: Exception | None = None
         for attempt in range(self.config.max_retries):
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                raise CollectionError(f"GET {path} exceeded collection deadline")
             try:
-                response = self.client.get(path)
+                request_timeout = (
+                    self.config.timeout_seconds
+                    if remaining is None
+                    else min(self.config.timeout_seconds, remaining)
+                )
+                response = self.client.get(path, timeout=request_timeout)
                 if response.status_code == 429:
                     retry_after = float(response.headers.get("Retry-After", "1"))
-                    time.sleep(min(max(retry_after, 0.1), 30.0))
+                    sleep_for = min(max(retry_after, 0.1), 30.0)
+                    if remaining is not None:
+                        sleep_for = min(sleep_for, max(0.0, remaining))
+                    time.sleep(sleep_for)
                     continue
                 response.raise_for_status()
                 return response.json()
             except (httpx.HTTPError, ValueError) as exc:
                 last_error = exc
                 if attempt + 1 < self.config.max_retries:
-                    time.sleep(2**attempt)
+                    sleep_for = float(2**attempt)
+                    if deadline is not None:
+                        sleep_for = min(sleep_for, max(0.0, deadline - time.monotonic()))
+                    time.sleep(sleep_for)
         raise CollectionError(f"GET {path} failed: {last_error}") from last_error
 
     def collect(self) -> RawCollection:
         started = time.monotonic()
+        deadline = started + 35.0
         # Majority-vote mempool fetch: probe several backend IPs directly and
         # adopt the healthy-cluster median (stale CDN backends are excluded).
         # The vote only applies when the effective target really is the
@@ -102,21 +132,38 @@ class MempoolClient:
         # host, and an injected transport must not receive raw-IP requests
         # nor be shared across the temporary probe clients).
         mempool: dict[str, Any]
+        mempool_quality = "accepted"
+        mempool_quality_reason: str | None = None
         if self._is_public_mempool_space() and self.transport is None:
-            mempool = fetch_mempool_majority() or self._get_json("/api/mempool")
+            majority = fetch_mempool_majority_result(
+                timeout=min(8.0, max(0.1, deadline - time.monotonic()))
+            )
+            if majority is None:
+                # A single DNS response is retained only as explicitly degraded
+                # data.  It must never masquerade as a quorum-verified sample.
+                mempool = self._get_json("/api/mempool", deadline=deadline)
+                mempool_quality = "degraded"
+                mempool_quality_reason = "majority quorum unavailable; single DNS read"
+            else:
+                mempool = majority.payload
+                mempool_quality = majority.quality
+                mempool_quality_reason = majority.reason
         else:
-            mempool = self._get_json("/api/mempool")
-        fees = self._get_json("/api/v1/fees/recommended")
-        projected = self._get_json("/api/v1/fees/mempool-blocks")
-        blocks = self._get_json("/api/blocks")
-        mining = self._fetch_mining_hashrate()
-        btc_price = self._fetch_btc_price()
+            mempool = self._get_json("/api/mempool", deadline=deadline)
+        fees = self._get_json("/api/v1/fees/recommended", deadline=deadline)
+        projected = self._get_json("/api/v1/fees/mempool-blocks", deadline=deadline)
+        blocks = self._get_json("/api/blocks", deadline=deadline)
+        mining = self._fetch_mining_hashrate(deadline - time.monotonic())
+        btc_price = self._fetch_btc_price(deadline - time.monotonic())
         latency_ms = (time.monotonic() - started) * 1000
 
         if not isinstance(mempool, dict) or not isinstance(fees, dict):
             raise CollectionError("API returned invalid mempool or fee data")
         if not isinstance(projected, list) or not isinstance(blocks, list):
             raise CollectionError("API returned invalid block data")
+        validation_error = validate_mempool_payload(mempool)
+        if validation_error is not None:
+            raise CollectionError(f"invalid mempool payload: {validation_error}")
         return RawCollection(
             collected_at=int(time.time()),
             mempool=mempool,
@@ -127,11 +174,20 @@ class MempoolClient:
             btc_price_usd=btc_price,
             current_difficulty=float(mining["currentDifficulty"]) if mining else None,
             current_hashrate=float(mining["currentHashrate"]) if mining else None,
+            quality=mempool_quality,
+            quality_reason=mempool_quality_reason,
         )
 
-    def _fetch_mining_hashrate(self) -> dict[str, Any] | None:
+    def _fetch_mining_hashrate(self, timeout: float | None = None) -> dict[str, Any] | None:
+        if timeout is not None and timeout <= 0:
+            return None
         try:
-            with httpx.Client(timeout=self.config.timeout_seconds) as client:
+            request_timeout = (
+                self.config.timeout_seconds
+                if timeout is None
+                else min(self.config.timeout_seconds, timeout)
+            )
+            with httpx.Client(timeout=request_timeout) as client:
                 resp = client.get("https://mempool.space/api/v1/mining/hashrate/24h")
                 resp.raise_for_status()
                 data = resp.json()
@@ -141,9 +197,16 @@ class MempoolClient:
         except Exception:
             return None
 
-    def _fetch_btc_price(self) -> float | None:
+    def _fetch_btc_price(self, timeout: float | None = None) -> float | None:
+        if timeout is not None and timeout <= 0:
+            return None
         try:
-            with httpx.Client(timeout=self.config.timeout_seconds) as client:
+            request_timeout = (
+                self.config.timeout_seconds
+                if timeout is None
+                else min(self.config.timeout_seconds, timeout)
+            )
+            with httpx.Client(timeout=request_timeout) as client:
                 resp = client.get(
                     "https://api.coingecko.com/api/v3/simple/price",
                     params={"ids": "bitcoin", "vs_currencies": "usd"},
@@ -213,8 +276,39 @@ def _is_real_number(x: Any) -> bool:
         return False
 
 
+def _is_nonnegative_integer(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def validate_mempool_payload(data: Any) -> str | None:
+    """Return a reason when a mempool payload is incomplete or invalid.
+
+    Validation happens before a response can contribute to a quorum.  This
+    prevents a count/vsize-only partial response from winning and failing later
+    in the processor after it has already been selected.
+    """
+    if not isinstance(data, dict):
+        return "payload is not an object"
+    for key in ("count", "vsize", "total_fee"):
+        if key not in data or not _is_nonnegative_integer(data[key]):
+            return f"{key} is missing or not a non-negative integer"
+    histogram = data.get("fee_histogram")
+    if not isinstance(histogram, list):
+        return "fee_histogram is missing or not a list"
+    for index, entry in enumerate(histogram):
+        if (
+            not isinstance(entry, list)
+            or len(entry) != 2
+            or not all(_is_real_number(item) for item in entry)
+        ):
+            return f"fee_histogram[{index}] is invalid"
+        if entry[0] < 0 or entry[1] < 0:
+            return f"fee_histogram[{index}] contains a negative value"
+    return None
+
+
 def _is_valid_mempool(data: Any) -> bool:
-    """Per-probe validation: accept only dicts with numeric count/vsize.
+    """Per-probe validation for a complete mempool payload.
 
     A single malformed response (e.g. ``count='100'``, missing ``vsize``,
     or a non-finite value) must not abort the whole majority vote — it is
@@ -223,17 +317,7 @@ def _is_valid_mempool(data: Any) -> bool:
     are rejected: a negative vsize used as a cluster centre would make
     every ratio negative and poison the adopted result.
     """
-    if not isinstance(data, dict):
-        return False
-    count = data.get("count")
-    vsize = data.get("vsize")
-    if not _is_real_number(count) or not _is_real_number(vsize):
-        return False
-    # _is_real_number guarantees count/vsize are finite non-bool numbers here.
-    assert isinstance(count, (int, float)) and isinstance(vsize, (int, float))
-    if count < 0 or vsize < 0:
-        return False
-    return True
+    return validate_mempool_payload(data) is None
 
 
 def _within_pct(x: float, y: float, pct: float = 0.08) -> bool:
@@ -242,9 +326,10 @@ def _within_pct(x: float, y: float, pct: float = 0.08) -> bool:
     Avoids division by zero: when the reference ``y`` is 0, agreement
     requires ``x`` to be exactly 0 too.
     """
-    if y == 0:
-        return x == 0
-    return abs(x - y) / y <= pct
+    denominator = max(abs(x), abs(y))
+    if denominator == 0:
+        return True
+    return abs(x - y) / denominator <= pct
 
 
 def fetch_mempool_majority(
@@ -254,23 +339,41 @@ def fetch_mempool_majority(
 ) -> dict[str, Any] | None:
     """Query several mempool.space backends and return the majority mempool.
 
-    Each backend IP is probed once with ``/api/mempool``.  The tx counts
-    should cluster tightly (current state); a backend that deviates >8%
-    from the median count (or vsize) is a stale read and is discarded.  If
-    a strict majority (``probe_count // 2 + 1``) of healthy responses
-    remain, the median of the healthy ones is returned as the adopted
-    mempool state (the response with the count closest to that median, so
-    fee_histogram etc. are real).  A tie (e.g. 2:2 with 4 probes) does not
-    reach the strict majority and yields None (caller falls back).
+    Each discovered backend IP is probed once with ``/api/mempool``.  A
+    unique strict quorum of the complete payloads must agree on both count
+    and vsize; failed or invalid targets remain in the quorum denominator.
+    The selected response is an actual member of that quorum, so its
+    fee_histogram and total_fee stay paired with its count/vsize.  An
+    ambiguous split or insufficient quorum yields None (caller records a
+    degraded DNS fallback).
 
     ``transport`` is optional: when provided it is used for the probes
     (instead of creating a fresh ``httpx.Client``), letting callers inject
     a mock transport and never hit the network.
     """
+    result = fetch_mempool_majority_result(
+        probe_count=probe_count, timeout=timeout, transport=transport
+    )
+    return result.payload if result is not None else None
+
+
+def fetch_mempool_majority_result(
+    probe_count: int = 5,
+    timeout: float = 8.0,
+    transport: httpx.BaseTransport | None = None,
+) -> MempoolRead | None:
+    """Probe every discovered backend and return an evidenced quorum result.
+
+    ``probe_count`` is retained for API compatibility but is no longer used to
+    truncate the discovered set.  With the current seven-backend fleet, a
+    strict 4/7 quorum is required; failed or invalid probes remain in the
+    denominator and cannot silently lower the quorum.
+    """
     ips = _resolve_mempool_ips()
     if len(ips) < 2:
         return None
-    targets = ips[:probe_count]
+    targets = list(dict.fromkeys(ips))
+    required = len(targets) // 2 + 1
 
     responses: list[dict[str, Any]] = []
     # One client for all probes: a caller-supplied transport must not be
@@ -285,84 +388,97 @@ def fetch_mempool_majority(
         trust_env=False,
         transport=transport,
     )
+    def probe(ip: str) -> dict[str, Any] | None:
+        try:
+            # Connect to the backend IP directly, keeping the Host header and
+            # SNI as mempool.space so TLS remains fully verified.
+            resp = client.get(
+                f"https://{ip}/api/mempool",
+                headers={
+                    "User-Agent": "mempool-monitor/0.1",
+                    "Host": "mempool.space",
+                },
+                extensions={"sni_hostname": "mempool.space"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if _is_valid_mempool(data):
+                return data
+        except Exception as exc:  # noqa: BLE001
+            logging.debug("mempool probe %s failed: %s", ip, exc)
+        return None
+
     try:
-        for ip in targets:
-            try:
-                # Connect to the backend IP directly, keeping the Host header
-                # as mempool.space.  We validate the certificate against
-                # mempool.space via the sni_hostname extension while still
-                # connecting to the raw IP: this keeps TLS fully verified
-                # (verify=True, trust_env=False) whereas the previous code
-                # disabled verification entirely.  The trade-off is that we
-                # must supply the Host + SNI ourselves so the handshake
-                # matches mempool.space's cert; on failure we fall back to a
-                # plain verified DNS fetch in the caller.
-                resp = client.get(
-                    f"https://{ip}/api/mempool",
-                    headers={
-                        "User-Agent": "mempool-monitor/0.1",
-                        "Host": "mempool.space",
-                    },
-                    extensions={"sni_hostname": "mempool.space"},
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                if _is_valid_mempool(data):
-                    responses.append(data)
-            except Exception as exc:  # noqa: BLE001
-                logging.debug("mempool probe %s failed: %s", ip, exc)
+        # Seven requests fit inside the per-request timeout without making the
+        # collection deadline equal to 7 * timeout.
+        with ThreadPoolExecutor(max_workers=len(targets), thread_name_prefix="mempool-probe") as pool:
+            futures = {pool.submit(probe, ip): ip for ip in targets}
+            results = {future: future.result() for future in as_completed(futures)}
+        responses = []
+        for future, _ip in sorted(
+            ((future, futures[future]) for future in results), key=lambda item: item[1]
+        ):
+            result = results[future]
+            if result is not None:
+                responses.append(result)
     finally:
         if owns_client:
             client.close()
 
     if not responses:
         return None
-    # Healthy cluster: the tx-count value around which most responses
-    # cluster.  A plain median breaks when stale reads are the majority of
-    # *responses* but not of the *cluster* — so instead we find the densest
-    # cluster: for each response, count neighbours within 8% on BOTH count
-    # and vsize; the response with the most neighbours is the centre.
+    # Find complete pairwise-agreement clusters.  The old center-neighbour
+    # heuristic could accept a non-transitive bridge and used an asymmetric
+    # percentage denominator.  The fleet is small, so exhaustive combinations
+    # are simpler and deterministic.
     def _count(r: dict[str, Any]) -> float:
         return float(r["count"])
 
     def _vsize(r: dict[str, Any]) -> float:
         return float(r["vsize"])
 
-    def _cluster_size(r: dict[str, Any]) -> int:
-        c = _count(r)
-        v = _vsize(r)
-        return sum(
-            1 for other in responses
-            if _within_pct(_count(other), c) and _within_pct(_vsize(other), v)
+    def agrees(left: dict[str, Any], right: dict[str, Any]) -> bool:
+        return _within_pct(_count(left), _count(right), 0.02) and _within_pct(
+            _vsize(left), _vsize(right), 0.02
         )
 
-    centre = max(responses, key=_cluster_size)
-    centre_c = _count(centre)
-    centre_v = _vsize(centre)
-    healthy = [
-        r for r in responses
-        if _within_pct(_count(r), centre_c) and _within_pct(_vsize(r), centre_v)
-    ]
-    # Strict majority: for an even probe count, exactly half is NOT enough
-    # (4 probes -> 3 required, so a 2:2 tie yields None / fallback).
-    required = probe_count // 2 + 1
-    if len(healthy) < required:
+    qualifying: list[tuple[dict[str, Any], ...]] = []
+    max_size = min(len(responses), len(targets))
+    for size in range(max_size, required - 1, -1):
+        for candidate in combinations(responses, size):
+            if all(agrees(left, right) for left, right in combinations(candidate, 2)):
+                qualifying.append(candidate)
+        if qualifying:
+            break
+    if not qualifying or len({tuple(id(item) for item in group) for group in qualifying}) != 1:
         logging.warning(
-            "mempool majority: only %d/%d healthy responses; falling back",
-            len(healthy), probe_count,
+            "mempool majority: no unique quorum (%d valid/%d targets; required=%d)",
+            len(responses), len(targets), required,
         )
         return None
-    # Adopt the response whose count is closest to the healthy median.
-    healthy_med = sorted(_count(r) for r in healthy)[
-        len(healthy) // 2
-    ]
-    adopted = min(healthy, key=lambda r: abs(_count(r) - healthy_med))
+    healthy = list(qualifying[0])
+    median_count = sorted(_count(r) for r in healthy)[len(healthy) // 2]
+    median_vsize = sorted(_vsize(r) for r in healthy)[len(healthy) // 2]
+    adopted = min(
+        healthy,
+        key=lambda r: (
+            abs(_count(r) - median_count) + abs(_vsize(r) - median_vsize),
+            _count(r),
+            _vsize(r),
+        ),
+    )
     logging.info(
-        "mempool majority: %d probes, %d healthy, adopted tx=%d vMB=%.1f",
-        len(responses), len(healthy), adopted["count"],
+        "mempool majority: %d targets, %d valid, quorum=%d, adopted tx=%d vMB=%.1f",
+        len(targets), len(responses), len(healthy), adopted["count"],
         adopted["vsize"] / 1e6,
     )
-    return adopted
+    return MempoolRead(
+        payload=adopted,
+        quality="accepted",
+        reason=f"unique quorum {len(healthy)}/{len(targets)}",
+        valid_probes=len(responses),
+        quorum_size=len(healthy),
+    )
 
 
 def fetch_difficulty(timeout: float = 10.0) -> dict[str, Any] | None:
@@ -447,9 +563,11 @@ def collect_once_all(config: Config, storage: Any) -> bool:
             # mempool.space's CDN occasionally alternates between a current
             # and a stale/partial response. If the new snapshot deviates too
             # far from the recent median, re-fetch once before accepting it.
-            previous = storage.latest_snapshot(before=snapshot.collected_at)
+            previous = storage.latest_snapshot(
+                before=snapshot.collected_at, quality="accepted"
+            )
             recent = storage.snapshots_since(
-                snapshot.collected_at - 3600
+                snapshot.collected_at - 3600, quality="accepted"
             )[-RECENT_FOR_SANITY:]
             if is_suspect(snapshot, previous, recent):
                 logging.warning(
@@ -457,46 +575,43 @@ def collect_once_all(config: Config, storage: Any) -> bool:
                     snapshot.mempool_count,
                     snapshot.mempool_vsize / 1_000_000,
                 )
-                raw = client.collect()
-                snapshot, projected = process_collection(raw, config)
-                if is_suspect(snapshot, previous, recent):
-                    # Second read still deviates: keep the reading (never
-                    # lose a genuine fast drain) but log it loudly as
-                    # suspect data so an operator can audit the spike.
-                    # (No quality column exists on the live table; the
-                    # display-time filter masks such points anyway.)
-                    logging.error(
-                        "SUSPECT DATA stored (count=%d vsize=%.1fMB) after double "
-                        "re-check — likely stale CDN read, masked at display",
-                        snapshot.mempool_count,
-                        snapshot.mempool_vsize / 1_000_000,
+                if raw.quality == "accepted":
+                    # A multi-backend quorum corroborates the reading.  A real
+                    # fast drain must not be demoted on the median heuristic
+                    # alone (the old height-advance widening is gone).
+                    logging.info(
+                        "snapshot deviates from median but is quorum-accepted "
+                        "(%s); keeping as accepted",
+                        raw.quality_reason or "quorum",
                     )
+                else:
+                    raw = client.collect()
+                    snapshot, projected = process_collection(raw, config)
+                    if is_suspect(snapshot, previous, recent):
+                        if raw.quality == "accepted":
+                            logging.info(
+                                "snapshot deviates from median but is "
+                                "quorum-accepted (%s); keeping as accepted",
+                                raw.quality_reason or "quorum",
+                            )
+                        else:
+                            # Second read still deviates: keep the reading
+                            # (never lose a genuine state) but label it so
+                            # alerts/charts can exclude it.
+                            snapshot = replace(
+                                snapshot,
+                                quality="suspect",
+                                quality_reason="failed sanity check twice on degraded read",
+                            )
+                            logging.error(
+                                "SUSPECT DATA stored (count=%d vsize=%.1fMB) after "
+                                "double re-check; quality=suspect",
+                                snapshot.mempool_count,
+                                snapshot.mempool_vsize / 1_000_000,
+                            )
     except Exception as exc:  # noqa: BLE001
         logging.error("main collection failed: %s", exc)
         snapshot = None
-
-    # Mining data write (side effect; does not set ok)
-    mine_snap: MiningSnapshot | None = None
-    if snapshot is not None and raw is not None:
-        if raw.current_difficulty is not None and raw.current_hashrate is not None:
-            mine_snap = MiningSnapshot(
-                collected_at=collected_at,
-                current_difficulty=raw.current_difficulty,
-                current_hashrate=raw.current_hashrate,
-            )
-            storage.insert_mining(mine_snap)
-
-    # Fallback: fetch mining data separately only when the main collection
-    # completely failed (no snapshot at all).
-    if snapshot is None:
-        mine_data = fetch_mining_hashrate()
-        if mine_data is not None:
-            mine_snap = MiningSnapshot(
-                collected_at=collected_at,
-                current_difficulty=float(mine_data["currentDifficulty"]),
-                current_hashrate=float(mine_data["currentHashrate"]),
-            )
-            storage.insert_mining(mine_snap)
 
     # Backfill mining fields on the snapshot BEFORE insert so the DB row
     # carries the last-known values when the fresh ones are missing (the
@@ -506,9 +621,7 @@ def collect_once_all(config: Config, storage: Any) -> bool:
         if snapshot.current_difficulty is None or snapshot.current_hashrate is None:
             last_mine = storage.latest_mining()
             if last_mine is not None and (collected_at - last_mine.collected_at) < 7200:
-                from dataclasses import replace as _replace  # noqa: PLC0415
-
-                snapshot = _replace(
+                snapshot = replace(
                     snapshot,
                     current_difficulty=snapshot.current_difficulty
                     if snapshot.current_difficulty is not None
@@ -518,30 +631,72 @@ def collect_once_all(config: Config, storage: Any) -> bool:
                     else last_mine.current_hashrate,
                 )
 
-    # Store the mempool snapshot — this is what makes the run successful.
+    # Store the mempool snapshot first.  Auxiliary tables must not be able to
+    # make an otherwise valid core collection disappear.
     if snapshot is not None:
         storage.insert_snapshot(snapshot, projected)
         ok = True
         logging.info(
-            "collected level=%s fee=%g mempool_vmb=%.1f block=%d",
+            "collected level=%s fee=%g mempool_vmb=%.1f block=%d quality=%s",
             snapshot.congestion_level.name,
             snapshot.fastest_fee,
             snapshot.mempool_vsize / 1_000_000,
             snapshot.latest_block_height,
+            snapshot.quality,
         )
 
-    # Difficulty (separate API call, but only ~hourly to keep 1-min collection light)
-    last_diff = storage.latest_difficulty()
-    if last_diff is None or collected_at - last_diff.collected_at > 3600:
-        diff_data = fetch_difficulty()
-        if diff_data is not None:
-            diff_snap = _difficulty_to_snapshot(diff_data)
-            storage.insert_difficulty(diff_snap)
-        else:
-            logging.warning("difficulty fetch failed; keeping last value")
+    # Mining data write is auxiliary; a collision or locked auxiliary table
+    # must not invalidate the already-committed core snapshot.
+    if snapshot is not None and raw is not None:
+        if raw.current_difficulty is not None and raw.current_hashrate is not None:
+            try:
+                storage.insert_mining(
+                    MiningSnapshot(
+                        collected_at=snapshot.collected_at,
+                        current_difficulty=raw.current_difficulty,
+                        current_hashrate=raw.current_hashrate,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                logging.error("mining auxiliary write failed: %s", exc)
 
-    # Enforce size limit
-    storage.enforce_size_limit()
+    # Fallback: fetch mining data separately only when the main collection
+    # completely failed (no snapshot at all).
+    if snapshot is None:
+        mine_data = fetch_mining_hashrate()
+        if mine_data is not None:
+            try:
+                storage.insert_mining(
+                    MiningSnapshot(
+                        collected_at=collected_at,
+                        current_difficulty=float(mine_data["currentDifficulty"]),
+                        current_hashrate=float(mine_data["currentHashrate"]),
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                logging.error("mining fallback write failed: %s", exc)
+
+    # Difficulty (separate API call, but only ~hourly to keep 1-min collection light)
+    try:
+        last_diff = storage.latest_difficulty()
+        if last_diff is None or collected_at - last_diff.collected_at > 3600:
+            diff_data = fetch_difficulty()
+            if diff_data is not None:
+                diff_snap = _difficulty_to_snapshot(diff_data)
+                try:
+                    storage.insert_difficulty(diff_snap)
+                except Exception as exc:  # noqa: BLE001
+                    logging.error("difficulty auxiliary write failed: %s", exc)
+            else:
+                logging.warning("difficulty fetch failed; keeping last value")
+    except Exception as exc:  # noqa: BLE001
+        logging.error("difficulty maintenance failed: %s", exc)
+
+    # Size maintenance is also outside the core collection result.
+    try:
+        storage.enforce_size_limit()
+    except Exception as exc:  # noqa: BLE001
+        logging.error("size maintenance failed: %s", exc)
     return ok
 
 

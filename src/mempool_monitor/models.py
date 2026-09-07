@@ -59,6 +59,8 @@ class Snapshot:
     btc_price_usd: float | None = None
     current_difficulty: float | None = None
     current_hashrate: float | None = None
+    quality: str = "accepted"
+    quality_reason: str | None = None
 
     def backlog(self, threshold: int) -> float:
         return float(getattr(self, f"backlog_{threshold}"))

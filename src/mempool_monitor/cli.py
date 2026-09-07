@@ -51,7 +51,7 @@ def configure_logging(config: Config, verbose: bool = False) -> None:
 
 
 def send_report(config: Config, storage: Storage, force: bool = False) -> bool:
-    latest = storage.latest_snapshot()
+    latest = storage.latest_snapshot(quality="accepted")
     if latest is None:
         logging.warning("report skipped: no snapshots")
         return False
@@ -127,7 +127,7 @@ def collect_once(config: Config, storage: Storage, notify: bool) -> int:
     if not ok:
         failures = int(storage.get_state("api_consecutive_failures", "0")) + 1
         storage.set_state("api_consecutive_failures", str(failures))
-        previous = storage.latest_snapshot()
+        previous = storage.latest_snapshot(quality="accepted")
         logging.error("collection failed (%d consecutive)", failures)
         if notify and failures == 3 and previous:
             send_alerts(
@@ -147,12 +147,25 @@ def collect_once(config: Config, storage: Storage, notify: bool) -> int:
 
     prior_failures = int(storage.get_state("api_consecutive_failures", "0"))
     storage.set_state("api_consecutive_failures", "0")
-    snapshot = storage.latest_snapshot()
-    if snapshot is None:
+    stored = storage.latest_snapshot()
+    if stored is None:
         return 1
-    fifteen_minutes_ago = storage.snapshot_at_or_before(snapshot.collected_at - 900)
-    alerts = evaluate_alerts(snapshot, storage.latest_snapshot(
-        before=snapshot.collected_at), fifteen_minutes_ago)
+    if stored.quality != "accepted":
+        logging.warning(
+            "notification skipped for quality=%s (%s)",
+            stored.quality,
+            stored.quality_reason or "no reason recorded",
+        )
+        return 0
+    snapshot = stored
+    fifteen_minutes_ago = storage.snapshot_at_or_before(
+        snapshot.collected_at - 900, quality="accepted"
+    )
+    alerts = evaluate_alerts(
+        snapshot,
+        storage.latest_snapshot(before=snapshot.collected_at, quality="accepted"),
+        fifteen_minutes_ago,
+    )
     if prior_failures >= 3:
         alerts.append(
             Alert(
@@ -247,14 +260,20 @@ def main(argv: list[str] | None = None) -> int:
                 now = int(time.time())
                 hours = args.hours or config.chart_hours
                 since = now - hours * 3600
-                snapshots = storage.snapshots_since(since)
+                snapshots = [
+                    s for s in storage.snapshots_since(since)
+                    if s.quality != "suspect"
+                ]
                 if not snapshots:
                     print("No snapshots in range; collecting one first …", file=sys.stderr)
                     ec = collect_once(config, storage, notify=False)
                     if ec:
                         print("Collection failed, cannot generate chart", file=sys.stderr)
                         return 1
-                    snapshots = storage.snapshots_since(since)
+                    snapshots = [
+                        s for s in storage.snapshots_since(since)
+                        if s.quality != "suspect"
+                    ]
                 output_path = args.output or str(
                     config.output_dir / f"mempool-chart-{now}.png"
                 )

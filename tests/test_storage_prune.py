@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -226,6 +228,57 @@ class ReclaimSpaceTest(unittest.TestCase):
         self.assertNotIn("size_pruned_at", calls["state"])
         self.assertEqual(self.storage.enforce_size_limit(), 100)
         self.assertEqual(calls["deleted"], 2)
+
+
+class SnapshotQualityTest(PruneOldestTest):
+    def test_quality_is_persisted_and_filters_are_explicit(self):
+        accepted = _snapshot(200)
+        suspect = replace(
+            _snapshot(201), quality="suspect", quality_reason="double sanity failure"
+        )
+        self.storage.insert_snapshot(accepted, [])
+        self.storage.insert_snapshot(suspect, [])
+
+        latest = self.storage.latest_snapshot()
+        self.assertIsNotNone(latest)
+        assert latest is not None
+        self.assertEqual(latest.quality, "suspect")
+        accepted_latest = self.storage.latest_snapshot(quality="accepted")
+        self.assertIsNotNone(accepted_latest)
+        assert accepted_latest is not None
+        self.assertEqual(accepted_latest.collected_at, 200)
+        accepted_rows = self.storage.snapshots_since(0, quality="accepted")
+        self.assertEqual([row.collected_at for row in accepted_rows], [200])
+
+    def test_legacy_rows_migrate_to_unknown_quality(self):
+        with tempfile.TemporaryDirectory(prefix="mempool-monitor-schema-") as tmp:
+            path = Path(tmp) / "legacy.sqlite3"
+            old = Storage(path)
+            old.initialize()
+            old.insert_snapshot(_snapshot(250), [])
+            old.connection.execute("ALTER TABLE snapshots DROP COLUMN quality_reason")
+            old.connection.execute("ALTER TABLE snapshots DROP COLUMN quality")
+            old.connection.commit()
+            old.close()
+
+            migrated = Storage(path)
+            migrated.initialize()
+            latest = migrated.latest_snapshot()
+            self.assertIsNotNone(latest)
+            assert latest is not None
+            self.assertEqual(latest.quality, "legacy_unknown")
+            migrated.close()
+
+    def test_same_second_snapshot_collision_does_not_replace_original(self):
+        original = _snapshot(300)
+        replacement = replace(original, mempool_vsize=999_999)
+        self.storage.insert_snapshot(original, [])
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.storage.insert_snapshot(replacement, [])
+        stored = self.storage.latest_snapshot()
+        self.assertIsNotNone(stored)
+        assert stored is not None
+        self.assertEqual(stored.mempool_vsize, original.mempool_vsize)
 
 
 if __name__ == "__main__":

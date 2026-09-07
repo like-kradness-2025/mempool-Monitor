@@ -87,6 +87,41 @@ class MajorityVoteTest(unittest.TestCase):
             result = fetch_mempool_majority(probe_count=5)
         self.assertIsNone(result)
 
+    def test_observed_five_high_two_low_selects_high_cluster(self) -> None:
+        near_stale = {"count": 77_492, "vsize": 38_658_000,
+                      "total_fee": 8_000_000, "fee_histogram": [[1, 2]]}
+        per_ip = {ip: HEALTHY for ip in IPS[:5]}
+        per_ip.update({IPS[5]: near_stale, IPS[6]: near_stale})
+        fake = _make_fake_get(per_ip)
+        with patch("mempool_monitor.collector._resolve_mempool_ips",
+                   return_value=IPS), \
+             patch("mempool_monitor.collector.httpx.Client", fake):
+            result = fetch_mempool_majority(probe_count=5)
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["count"], HEALTHY["count"])
+
+    def test_two_high_three_low_has_no_quorum(self) -> None:
+        per_ip = {IPS[0]: HEALTHY, IPS[1]: HEALTHY,
+                  IPS[2]: STALE, IPS[3]: STALE, IPS[4]: STALE}
+        fake = _make_fake_get(per_ip)
+        with patch("mempool_monitor.collector._resolve_mempool_ips",
+                   return_value=IPS), \
+             patch("mempool_monitor.collector.httpx.Client", fake):
+            result = fetch_mempool_majority()
+        self.assertIsNone(result)
+
+    def test_partial_payload_cannot_form_quorum(self) -> None:
+        partial = {"count": HEALTHY["count"], "vsize": HEALTHY["vsize"]}
+        per_ip = {IPS[0]: partial, IPS[1]: partial, IPS[2]: partial,
+                  IPS[3]: HEALTHY, IPS[4]: HEALTHY}
+        fake = _make_fake_get(per_ip)
+        with patch("mempool_monitor.collector._resolve_mempool_ips",
+                   return_value=IPS), \
+             patch("mempool_monitor.collector.httpx.Client", fake):
+            result = fetch_mempool_majority()
+        self.assertIsNone(result)
+
 
 if __name__ == "__main__":
     unittest.main()

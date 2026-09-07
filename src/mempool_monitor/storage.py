@@ -61,7 +61,9 @@ class Storage:
                 latest_block_weight INTEGER NOT NULL,
                 congestion_level TEXT NOT NULL,
                 provider TEXT NOT NULL,
-                api_latency_ms REAL NOT NULL
+                api_latency_ms REAL NOT NULL,
+                quality TEXT NOT NULL DEFAULT 'accepted',
+                quality_reason TEXT
             );
 
             CREATE TABLE IF NOT EXISTS projected_blocks (
@@ -130,6 +132,22 @@ class Storage:
                 )
             except sqlite3.OperationalError:
                 pass  # column already exists
+        try:
+            # Existing rows have no provenance and must not be presented as
+            # quorum-verified data after the migration.
+            self.connection.execute(
+                "ALTER TABLE snapshots ADD COLUMN quality TEXT NOT NULL "
+                "DEFAULT 'legacy_unknown'"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        try:
+            self.connection.execute(
+                "ALTER TABLE snapshots ADD COLUMN quality_reason TEXT"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        self.connection.commit()
 
     def insert_snapshot(
         self, snapshot: Snapshot, projected_blocks: list[ProjectedBlock]
@@ -139,7 +157,7 @@ class Storage:
         placeholders = ", ".join(f":{name}" for name in data)
         with self.connection:
             self.connection.execute(
-                f"INSERT OR REPLACE INTO snapshots ({columns}) VALUES ({placeholders})",
+                f"INSERT INTO snapshots ({columns}) VALUES ({placeholders})",
                 data,
             )
             self.connection.execute(
@@ -180,41 +198,50 @@ class Storage:
         )
         return Snapshot(**data)
 
-    def latest_snapshot(self, before: int | None = None) -> Snapshot | None:
-        if before is None:
-            row = self.connection.execute(
-                "SELECT * FROM snapshots ORDER BY collected_at DESC LIMIT 1"
-            ).fetchone()
-        else:
-            row = self.connection.execute(
-                """
-                SELECT * FROM snapshots
-                WHERE collected_at < ?
-                ORDER BY collected_at DESC LIMIT 1
-                """,
-                (before,),
-            ).fetchone()
-        return self._snapshot(row)
-
-    def snapshot_at_or_before(self, timestamp: int) -> Snapshot | None:
+    def latest_snapshot(
+        self, before: int | None = None, quality: str | None = None
+    ) -> Snapshot | None:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if before is not None:
+            clauses.append("collected_at < ?")
+            params.append(before)
+        if quality is not None:
+            clauses.append("quality = ?")
+            params.append(quality)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         row = self.connection.execute(
-            """
-            SELECT * FROM snapshots
-            WHERE collected_at <= ?
-            ORDER BY collected_at DESC LIMIT 1
-            """,
-            (timestamp,),
+            f"SELECT * FROM snapshots{where} "
+            "ORDER BY collected_at DESC LIMIT 1",
+            params,
         ).fetchone()
         return self._snapshot(row)
 
-    def snapshots_since(self, timestamp: int) -> list[Snapshot]:
+    def snapshot_at_or_before(
+        self, timestamp: int, quality: str | None = None
+    ) -> Snapshot | None:
+        quality_clause = " AND quality = ?" if quality is not None else ""
+        params: list[Any] = [timestamp]
+        if quality is not None:
+            params.append(quality)
+        row = self.connection.execute(
+            "SELECT * FROM snapshots WHERE collected_at <= ?"
+            f"{quality_clause} ORDER BY collected_at DESC LIMIT 1",
+            params,
+        ).fetchone()
+        return self._snapshot(row)
+
+    def snapshots_since(
+        self, timestamp: int, quality: str | None = None
+    ) -> list[Snapshot]:
+        quality_clause = " AND quality = ?" if quality is not None else ""
+        params: list[Any] = [timestamp]
+        if quality is not None:
+            params.append(quality)
         rows = self.connection.execute(
-            """
-            SELECT * FROM snapshots
-            WHERE collected_at >= ?
-            ORDER BY collected_at ASC
-            """,
-            (timestamp,),
+            "SELECT * FROM snapshots WHERE collected_at >= ?"
+            f"{quality_clause} ORDER BY collected_at ASC",
+            params,
         ).fetchall()
         return [snapshot for row in rows if (snapshot := self._snapshot(row))]
 
@@ -287,7 +314,7 @@ class Storage:
     def insert_difficulty(self, snapshot: DifficultySnapshot) -> None:
         with self.connection:
             self.connection.execute(
-                """INSERT OR REPLACE INTO difficulty
+                """INSERT INTO difficulty
                    (collected_at, progress_percent, difficulty_change,
                     estimated_retarget_date, remaining_blocks, remaining_time,
                     previous_retarget, previous_time, next_retarget_height,
@@ -316,7 +343,7 @@ class Storage:
     def insert_mining(self, snapshot: MiningSnapshot) -> None:
         with self.connection:
             self.connection.execute(
-                """INSERT OR REPLACE INTO mining
+                """INSERT INTO mining
                    (collected_at, current_difficulty, current_hashrate)
                    VALUES (?, ?, ?)""",
                 (snapshot.collected_at, snapshot.current_difficulty, snapshot.current_hashrate),

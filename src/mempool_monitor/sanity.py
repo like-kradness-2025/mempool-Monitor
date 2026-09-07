@@ -17,13 +17,11 @@ from __future__ import annotations
 from .models import Snapshot
 
 # Deviation thresholds vs recent median.
-# A block confirmation (height advance) legitimately drains the mempool,
-# so allow a wider band right after a new block; when the height is
-# static, a >10% drop can only be a stale CDN read -> reject.
+# A block-height advance alone does not prove that the mempool response is
+# fresh: stale CDN backends have been observed to report the current height.
+# Freshness must come from the quorum/bundle evidence, not this heuristic.
 MAX_COUNT_DEV_RATIO = 0.10   # >10% away from median tx count -> reject
 MAX_VSIZE_DEV_RATIO = 0.10   # >10% away from median vsize -> reject
-WIDE_COUNT_DEV_RATIO = 0.15  # right after a block, allow up to 15%
-WIDE_VSIZE_DEV_RATIO = 0.15  # right after a block, allow up to 15%
 RECENT_WINDOW = 7            # snapshots to use for the median
 
 
@@ -62,18 +60,9 @@ def is_plausible(
     if med_count <= 0 or med_vsize <= 0:
         return True
 
-    # Right after a new block the mempool legitimately drains; widen the
-    # band for that first sample so real post-block dips are not rejected.
-    height_advanced = (
-        previous is not None
-        and current.latest_block_height > previous.latest_block_height
-    )
-    cnt_limit = WIDE_COUNT_DEV_RATIO if height_advanced else MAX_COUNT_DEV_RATIO
-    vsz_limit = WIDE_VSIZE_DEV_RATIO if height_advanced else MAX_VSIZE_DEV_RATIO
-
     count_dev = abs(current.mempool_count - med_count) / med_count
     vsize_dev = abs(current.mempool_vsize - med_vsize) / med_vsize
-    if count_dev > cnt_limit or vsize_dev > vsz_limit:
+    if count_dev > MAX_COUNT_DEV_RATIO or vsize_dev > MAX_VSIZE_DEV_RATIO:
         return False
     return True
 
@@ -104,13 +93,6 @@ def is_suspect(
     if med_count <= 0 or med_vsize <= 0:
         return False
 
-    height_advanced = (
-        previous is not None
-        and current.latest_block_height > previous.latest_block_height
-    )
-    cnt_limit = WIDE_COUNT_DEV_RATIO if height_advanced else MAX_COUNT_DEV_RATIO
-    vsz_limit = WIDE_VSIZE_DEV_RATIO if height_advanced else MAX_VSIZE_DEV_RATIO
-
     count_dev = abs(current.mempool_count - med_count) / med_count
     vsize_dev = abs(current.mempool_vsize - med_vsize) / med_vsize
-    return count_dev > cnt_limit or vsize_dev > vsz_limit
+    return count_dev > MAX_COUNT_DEV_RATIO or vsize_dev > MAX_VSIZE_DEV_RATIO

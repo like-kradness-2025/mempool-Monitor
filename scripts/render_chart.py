@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Render the 6-panel mempool dashboard chart from stored snapshots.
 
-Used by the 15-minute delivery cron job. Prints "chart: <path>" on success.
+Used by the 5-minute delivery cron job (24-hour window).
+Prints "chart: <path>" on success.
 """
 from __future__ import annotations
 
@@ -25,7 +26,7 @@ def main() -> int:
 
     rc = subprocess.run(
         [PYTHON, "-m", "mempool_monitor.cli", "chart", "--output", str(out_path),
-         "--hours", "3"],
+         "--hours", "24"],
         cwd=REPO_ROOT, env=env, capture_output=True, text=True,
     ).returncode
     if rc != 0:
